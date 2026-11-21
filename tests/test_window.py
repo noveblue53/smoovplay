@@ -110,6 +110,7 @@ class _Shell:
             ref._obj.value = h  # a process per window is enough here
         u32 = type("U32", (), {
             "EnumWindows": staticmethod(lambda each, _: [each(h, 0) for h in self.TOP]),
+            "EnumChildWindows": staticmethod(lambda parent, each, _: all(each(c, 0) for c, _, _ in self.TOP[parent][2])),
             "IsWindowVisible": staticmethod(lambda h: True), "GetWindow": staticmethod(lambda h, rel: None),
             "GetWindowLongW": staticmethod(lambda h, i: 0), "IsIconic": staticmethod(lambda h: False),
             "GetWindowThreadProcessId": staticmethod(set_pid),
@@ -130,6 +131,25 @@ def test_a_store_apps_frame_is_listed_as_the_app_inside_it(monkeypatch):
     assert found[400].app == "Xbox app" and found[600].exe == "storegame.exe"
     assert [w.hwnd for w in window.find_windows()][-1] == 600  # known apps first
     assert pick("xbox").hwnd in (100, 400)
+
+
+def test_xbox_inside_a_nested_store_window_is_listed_by_its_top_level_frame(monkeypatch):
+    children = [(301, "Renderer", "renderer.exe"), (302, "Wrapper", "applicationframehost.exe")]
+    monkeypatch.setitem(_Shell.TOP, 300, ("applicationframehost.exe", "Xbox stream", children))
+    _Shell(monkeypatch)
+    u32 = window._api()[0]
+    exe_of = window._exe_of
+    monkeypatch.setattr(window, "_exe_of", lambda h, cache: "xboxpcapp.exe" if h == 303 else exe_of(h, cache))
+    enum = u32.EnumChildWindows
+
+    def descendants(parent, visit, arg):
+        if parent == 300:
+            return all(visit(hwnd, arg) for hwnd in (301, 302, 303))  # 303 is the app inside the wrapper
+        return enum(parent, visit, arg)
+
+    monkeypatch.setattr(u32, "EnumChildWindows", descendants)
+    nested = next(w for w in window.find_windows() if w.hwnd == 300)
+    assert (nested.exe, nested.app) == ("xboxpcapp.exe", "Xbox app")
 
 
 # ----------------------------------------------------------------------------- the source
@@ -531,3 +551,94 @@ def test_a_running_streaming_app_left_off_the_list_says_why(monkeypatch):
     window.find_windows(left_out)
     assert left_out == {"xboxpcappce.exe": {"on another desktop, or not shown yet"}}
     assert "explorer.exe" not in str(left_out) and "Documents" not in str(left_out)  # other apps are never noted
+
+
+@pytest.fixture
+def selected_window_api(monkeypatch):
+    _Shell(monkeypatch)
+    u32, _, dwm = window._api()
+    monkeypatch.setattr(window.os, "getpid", lambda: 9876)
+    monkeypatch.setattr(u32, "IsWindow", lambda h: h in _Shell.TOP, raising=False)
+    monkeypatch.setattr(u32, "GetAncestor", lambda h, flag: h, raising=False)
+    monkeypatch.setattr(u32, "GetShellWindow", lambda: 1, raising=False)
+    monkeypatch.setattr(u32, "GetDesktopWindow", lambda: 2, raising=False)
+    monkeypatch.setattr(u32, "GetClassNameW", lambda h, buf, n: setattr(buf, "value", "AppWindow"), raising=False)
+    return u32, dwm
+
+
+def test_manually_selected_xbox_can_be_owned_titleless_with_unknown_executable(selected_window_api, monkeypatch):
+    u32, _ = selected_window_api
+    monkeypatch.setattr(u32, "GetWindow", lambda hwnd, flag: 88)
+    monkeypatch.setattr(u32, "GetWindowTextLengthW", lambda hwnd: 0)
+    monkeypatch.setattr(u32, "GetWindowTextW", lambda hwnd, buf, size: 0)
+    monkeypatch.setattr(window, "_exe_of", lambda hwnd, cache: "")
+    assert window.find_windows() == []
+    selected = pick("xbox-hwnd:400:400")
+    assert selected.hwnd == 400 and selected.xbox_owner_pid == 400
+    assert selected.exe == selected.title == "" and selected.app == "Selected Xbox stream"
+    desk = _Desk(monkeypatch)
+    assert WindowSource(selected, open_fn=desk.open).xbox_window
+
+
+def test_selected_xbox_resolves_hosted_child_but_pins_host_pid(selected_window_api):
+    selected = pick("xbox-hwnd:100:100")
+    assert selected.hwnd == selected.xbox_owner_pid == 100
+    assert selected.exe == "xboxpcapp.exe" and selected.app == "Xbox app"
+    assert pick("xbox-hwnd:100:101") is None  # child PID is not that of the selected top-level window
+    # The host itself is usable if the decoder process cannot be identified.
+    assert pick("xbox-hwnd:300:300").exe == window.STORE_FRAME
+    # Selecting a different decoder does not rewrite its real executable name.
+    assert pick("xbox-hwnd:600:600").exe == "storegame.exe"
+
+
+def test_selected_xbox_accepts_a_visible_window_when_dwm_does_not_report_cloaking(selected_window_api, monkeypatch):
+    _, dwm = selected_window_api
+    monkeypatch.setattr(dwm, "DwmGetWindowAttribute", lambda *args: -2147467263)  # E_NOTIMPL
+    assert pick("xbox-hwnd:400:400").hwnd == 400
+
+
+@pytest.mark.parametrize("query", [
+    "xbox-hwnd:0:0", "xbox-hwnd:77:77", "xbox-hwnd:400:9876", "xbox-hwnd:400:401",
+    "xbox-hwnd:0x190:400", "xbox-hwnd:18446744073709551616:400", "xbox-hwnd:400:4294967696",
+    "xbox-hwnd:500:500", "xbox-hwnd:200:200",  # Explorer or Windows Settings hosted in a Store frame
+    "xbox-hwnd:400:401|exe:xboxpcappce.exe", "xbox|xbox-hwnd:400:401",
+])
+def test_selected_xbox_never_uses_an_alternative(selected_window_api, query):
+    assert pick(query) is None
+
+
+@pytest.mark.parametrize("method, result", [
+    ("IsWindowVisible", False), ("IsIconic", True), ("GetAncestor", 100),
+    ("GetShellWindow", 400), ("GetDesktopWindow", 400),
+])
+def test_selected_xbox_requires_a_visible_usable_toplevel(selected_window_api, monkeypatch, method, result):
+    u32, _ = selected_window_api
+    monkeypatch.setattr(u32, method, lambda *a: result)
+    assert pick("xbox-hwnd:400:400") is None
+
+
+def test_selected_xbox_rejects_other_desktops_small_windows_and_launcher(selected_window_api, monkeypatch):
+    u32, dwm = selected_window_api
+    monkeypatch.setattr(dwm, "DwmGetWindowAttribute", lambda h, a, ref, size: setattr(ref._obj, "value", 1) or 0)
+    assert pick("xbox-hwnd:400:400") is None
+    monkeypatch.setattr(dwm, "DwmGetWindowAttribute", lambda *a: 0)
+    monkeypatch.setattr(window, "client_rect", lambda h: Rect(0, 0, 319, 1080))
+    assert pick("xbox-hwnd:400:400") is None
+    monkeypatch.setattr(window, "client_rect", lambda h: MON)
+    monkeypatch.setattr(window, "_exe_of", lambda *a: "smoovplay.exe")
+    assert pick("xbox-hwnd:400:400") is None
+    monkeypatch.setattr(window, "_exe_of", lambda *a: "")
+    monkeypatch.setattr(u32, "GetClassNameW", lambda h, buf, n: setattr(buf, "value", "WorkerW"))
+    assert pick("xbox-hwnd:400:400") is None
+
+
+def test_selected_xbox_capture_stops_when_handle_changes_owner(monkeypatch):
+    desk = _Desk(monkeypatch)
+    source = WindowSource(AppWindow(400, "", "renderer.exe", 1280, 720, xbox_owner_pid=52),
+                          size=(640, 360), open_fn=desk.open)
+    owners = iter([52, 62])
+    u32 = window._api()[0]
+    monkeypatch.setattr(u32, "GetWindowThreadProcessId", lambda h, ref: setattr(ref._obj, "value", next(owners)),
+                        raising=False)
+    assert [t.index for t in source] == [0]
+    assert all(c.closed for c in desk.opened)

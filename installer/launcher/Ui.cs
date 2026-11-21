@@ -23,6 +23,7 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Automation;
+using System.Windows.Automation.Peers;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
@@ -48,6 +49,10 @@ namespace SmoovPlay
         Installer installer;
         Session session;
         SourceDef source = Paths.XboxBuild ? new SourceDef { Kind = "window", Name = "App window", Experimental = true, TestMode = false } : Sources.RemotePlay;  // where the video comes from (the Play page's picker)
+        XboxWindowTarget xboxTarget; // this launcher session only
+        DispatcherTimer xboxPickTimer;
+        string xboxPickNote;
+        bool loadingWindows;
         bool allowClose, finishSetup;
         string page;
         readonly HashSet<string> prefs;
@@ -235,6 +240,7 @@ namespace SmoovPlay
             Click("BtnMin", () => Window.WindowState = WindowState.Minimized);
             Click("BtnClose", () => Window.Close());
             Window.Closing += OnClosing;
+            Window.Closed += (s, e) => StopXboxPick();
             Window.Activated += (s, e) => UpdateAmbient();
             Window.Deactivated += (s, e) => UpdateAmbient();
             Window.StateChanged += (s, e) => UpdateAmbient();
@@ -367,6 +373,7 @@ namespace SmoovPlay
             var el = E(name);
             bool changed = page != name;
             if (changed && page == "PageLooks") OnLooksLeave();
+            if (changed && page == "PagePlay" && xboxPickTimer != null) { StopXboxPick(); BuildDevices(); }
             page = name;
             Show(el, true);
             if (changed)
@@ -1321,6 +1328,7 @@ namespace SmoovPlay
         void SetSource(SourceDef s, bool save)
         {
             bool changed = s.Kind != source.Kind;
+            if (changed) StopXboxPick();
             source = s;
             if (save) { Sources.Choose(prefs, s.Kind); Prefs.Save(prefs); }
             E<RadioButton>("NavGuide").Content = s.RemotePlay ? "Connect your PS5" : "Set up";
@@ -1342,7 +1350,7 @@ namespace SmoovPlay
             host.Children.Clear();
             var offered = Sources.Offered(paths);
             Show(host, offered.Count > 1);
-            if (offered.Count < 2) return;
+            if (offered.Count < 2) { BuildDevices(); return; }
             foreach (var s in offered)
             {
                 bool on = s.Kind == source.Kind;
@@ -1419,35 +1427,106 @@ namespace SmoovPlay
             host.Children.Add(LookAgain());
         }
 
+        const string XboxPickHelp = "Alt+Tab to or click the Xbox Remote Play window. Leave it in front for five seconds, then return here to review your selection.";
+        const string ManualWindow = "foreground";
+        bool NeedsWindowChoice { get { return xboxTarget == null && xboxPickNote != null; } }
+
+        void StopXboxPick()
+        {
+            if (xboxPickTimer == null) return;
+            xboxPickTimer.Stop();
+            xboxPickTimer = null;
+        }
+
+        void PickXboxWindow()
+        {
+            if (xboxPickTimer != null) { StopXboxPick(); BuildDevices(); return; }
+            if (session != null && session.Running) { Toast("Stop playing before picking a window.", true); return; }
+            xboxPickTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+            xboxPickTimer.Tick += (o, e) =>
+            {
+                StopXboxPick();
+                if (source.Kind != "window" || page != "PagePlay") return;
+                xboxTarget = XboxWindowTarget.Foreground(out string why);
+                xboxPickNote = why == null ? "Review the selected app, then press Play." : why + " Pick its window again or choose from the App list.";
+                BuildDevices();
+            };
+            xboxPickTimer.Start();
+            BuildDevices();
+        }
+
         void BuildWindows(WrapPanel host)
         {
+            string hint = null;
             if (!AppWindows.Loaded)
             {
-                host.Children.Add(new TextBlock { Text = "Looking for app windows…", FontSize = 12.5, Foreground = R("Text2"), Margin = new Thickness(4, 8, 4, 0) });
-                Task.Run(() => { AppWindows.Load(paths); OnUi(BuildDevices); });
-                return;
+                hint = "Looking for app windows…";
+                if (!loadingWindows)
+                {
+                    loadingWindows = true;
+                    Task.Run(() => { AppWindows.Load(paths); OnUi(() => { loadingWindows = false; BuildDevices(); }); });
+                }
             }
-            string hint = AppWindows.MissedHint();
-            if (AppWindows.List.Count == 0)
+            else if (xboxTarget == null)
             {
-                host.Children.Add(new TextBlock { Text = hint ?? "No app window found. Open the app you stream with (PS Remote Play, the Xbox app, Moonlight or a browser), then press Look again.", FontSize = 12.5, Foreground = R("Warn"), Margin = new Thickness(4, 8, 4, 0), TextWrapping = TextWrapping.Wrap, MaxWidth = 420 });
-                host.Children.Add(LookAgain());
-                return;
+                hint = AppWindows.MissedHint();
+                if (AppWindows.List.Count == 0 && hint == null)
+                    hint = Paths.XboxBuild ? "No app window found. Start Remote Play in the Xbox app, then pick its window."
+                        : "No app window found. Open the app you stream with (PS Remote Play, the Xbox app, Moonlight or a browser), then press Look again.";
             }
-            var chosen = AppWindows.Chosen(prefs);
-            var app = DeviceDrop("window-app", "App window", AppWindows.List.Select(w => new KeyValuePair<string, string>(w.Hwnd.ToString(), AppWindows.Label(w))),
-                                 chosen != null ? chosen.Hwnd.ToString() : "", v =>
+
+            var choices = AppWindows.Loaded ? AppWindows.List.Select(w => new KeyValuePair<string, string>(w.Hwnd.ToString(), AppWindows.Label(w))).ToList()
+                                            : new List<KeyValuePair<string, string>>();
+            if (xboxTarget != null)
+                choices.Insert(0, new KeyValuePair<string, string>(ManualWindow, xboxTarget.Label));
+            if (choices.Count > 0)
             {
-                var w = AppWindows.List.FirstOrDefault(x => x.Hwnd.ToString() == v);
-                CaptureDevices.Choose(prefs, "window-app:", w != null ? w.Exe : null);
-                CaptureDevices.Choose(prefs, "window-hwnd:", v);
-                Prefs.Save(prefs);
-            });
-            app.MaxWidth = 420;
-            host.Children.Add(Labelled("App", app));
-            host.Children.Add(LookAgain());
-            if (hint != null)  // e.g. a browser is listed, but the Xbox app is minimised
-                host.Children.Add(new TextBlock { Text = hint, FontSize = 12.5, Foreground = R("Text2"), Margin = new Thickness(4, 8, 4, 0), TextWrapping = TextWrapping.Wrap, MaxWidth = 420 });
+                var chosen = NeedsWindowChoice ? null : AppWindows.Chosen(prefs);
+                var app = DeviceDrop("window-app", "App window", choices, xboxTarget != null ? ManualWindow : chosen?.Hwnd.ToString(), v =>
+                {
+                    if (v == ManualWindow) return;
+                    bool hadPick = xboxTarget != null || xboxPickTimer != null || xboxPickNote != null;
+                    StopXboxPick();
+                    xboxTarget = null;
+                    xboxPickNote = null;
+                    var w = AppWindows.List.FirstOrDefault(x => x.Hwnd.ToString() == v);
+                    CaptureDevices.Choose(prefs, "window-app:", w?.Exe);
+                    CaptureDevices.Choose(prefs, "window-hwnd:", v);
+                    Prefs.Save(prefs);
+                    if (hadPick) BuildDevices();
+                }, selectFirst: !NeedsWindowChoice);
+                app.MaxWidth = 420;
+                host.Children.Add(Labelled("App", app));
+            }
+            if (AppWindows.Loaded) host.Children.Add(LookAgain());
+            if (Paths.XboxBuild)
+            {
+                var b = new Button { Content = xboxPickTimer != null ? "Cancel pick" : "Pick Xbox window…", Style = S("Secondary"),
+                                     Margin = new Thickness(4), VerticalAlignment = VerticalAlignment.Center, ToolTip = XboxPickHelp };
+                AutomationProperties.SetAutomationId(b, "pick-xbox-window");
+                AutomationProperties.SetHelpText(b, XboxPickHelp);
+                b.Click += (o, e) => PickXboxWindow();
+                host.Children.Add(b);
+                hint = xboxPickTimer != null ? XboxPickHelp : xboxPickNote ?? hint;
+            }
+            if (hint != null)
+            {
+                var note = new TextBlock { Text = hint, FontSize = 12.5, Foreground = R("Text2"), Margin = new Thickness(4, 8, 4, 0),
+                                           TextWrapping = TextWrapping.Wrap, MaxWidth = 420 };
+                AutomationProperties.SetAutomationId(note, "window-pick-status");
+                if (xboxPickTimer != null || xboxPickNote != null)
+                {
+                    AutomationProperties.SetLiveSetting(note, AutomationLiveSetting.Polite);
+                    if (xboxTarget != null && xboxPickTimer == null)
+                        AutomationProperties.SetName(note, xboxTarget.Label + ". " + hint);
+                    note.Loaded += (o, e) =>
+                    {
+                        if (AutomationPeer.ListenerExists(AutomationEvents.LiveRegionChanged))
+                            FrameworkElementAutomationPeer.CreatePeerForElement(note)?.RaiseAutomationEvent(AutomationEvents.LiveRegionChanged);
+                    };
+                }
+                host.Children.Add(note);
+            }
         }
 
         // ---- App window mode's keys (WindowKeys.cs) --------------------------------------------------------------
@@ -1605,7 +1684,7 @@ namespace SmoovPlay
             return sp;
         }
 
-        ComboBox DeviceDrop(string id, string name, IEnumerable<KeyValuePair<string, string>> choices, string selected, Action<string> picked)
+        ComboBox DeviceDrop(string id, string name, IEnumerable<KeyValuePair<string, string>> choices, string selected, Action<string> picked, bool selectFirst = true)
         {
             var drop = new ComboBox { Style = S("Drop"), MinWidth = 200, MaxWidth = 300, VerticalAlignment = VerticalAlignment.Center };
             AutomationProperties.SetAutomationId(drop, id);
@@ -1616,7 +1695,7 @@ namespace SmoovPlay
                 drop.Items.Add(item);
                 if (c.Key == selected) drop.SelectedItem = item;
             }
-            if (drop.SelectedItem == null && drop.Items.Count > 0) drop.SelectedIndex = 0;
+            if (drop.SelectedItem == null && drop.Items.Count > 0) drop.SelectedIndex = selectFirst ? 0 : -1;
             drop.SelectionChanged += (o, e) =>
             {
                 if (session != null && session.Running) { Toast("Stop playing first, then choose the card", true); return; }
@@ -1665,6 +1744,15 @@ namespace SmoovPlay
         /// <summary>test: "Test with a 60 fps game", played as if it were 30 fps, with a report at the end.</summary>
         void OnPlay(bool test)
         {
+            if (xboxPickTimer != null) { Toast(XboxPickHelp, false); return; }
+            if (source.Kind == "window" && NeedsWindowChoice) { Toast("Choose an app or pick the Xbox window before playing.", true); return; }
+            if (source.Kind == "window" && xboxTarget != null && !xboxTarget.IsCurrent(out string why))
+            {
+                xboxTarget = null;
+                xboxPickNote = why + " Pick its window again or select another app from the list.";
+                BuildDevices();
+                return;
+            }
             if (!paths.RuntimeReady) { ShowFinishSetup(); return; }
             if (detecting) { Toast("Auto-detect is still testing the graphics card. A few more seconds", true); return; }
             if (!source.RemotePlay) { StartSession(test); return; }  // chiaki-ng isn't involved
@@ -1693,7 +1781,7 @@ namespace SmoovPlay
             }
             if (source.Kind == "window")
             {
-                s.WindowApp = AppWindows.Query(AppWindows.Chosen(prefs));
+                s.WindowApp = xboxTarget?.Query ?? AppWindows.Query(AppWindows.Chosen(prefs));
                 s.WindowKeysArg = WindowKeys.Arg(prefs);
                 WindowKeys.Live = null;  // until this session says what it got
                 keysEditing = false;
@@ -1736,6 +1824,8 @@ namespace SmoovPlay
             string title, sub;
             bool busy = st == PlayState.Starting || st == PlayState.Waiting || st == PlayState.Found || st == PlayState.Building;
             bool running = busy || st == PlayState.Playing;
+            if (Paths.XboxBuild && source.Kind == "window") E("PlayDevices").IsEnabled = !running;
+            else E("PlayDevices").IsEnabled = true;
             switch (st)
             {
                 case PlayState.Starting: title = "Starting SmoovPlay"; sub = "Waking up the AI model..."; break;

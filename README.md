@@ -26,6 +26,8 @@ Download **SmoovPlay-Xbox-Web-Setup.exe** on your Windows PC and run the setup w
 
 Start Remote Play in the Windows Xbox app and leave the stream visible. Open **SmoovPlay Xbox**, confirm **App window** shows the Xbox app, and press **Play**. The first launch uses the 60 fps RTX 4070 Ti profile with RIFE 4.22 Lite and FSR 1. The Xbox app handles the controller and audio.
 
+If the stream is missing from the list, click **Pick Xbox window…**, switch to the live Xbox stream, and leave it in front for five seconds. Switch back to SmoovPlay Xbox, check the selected window, and press **Play**.
+
 <p align="center">
   <a href="https://github.com/smoovplay/smoovplay/releases"><img alt="Status: early release" src="https://img.shields.io/badge/status-early%20release-FFB02E?style=flat-square"></a>
   <a href="https://github.com/smoovplay/smoovplay/releases"><img alt="Downloads of SmoovPlay-Setup.exe, all releases" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fsmoovplay%2Fsmoovplay%2Fstats%2Fdownloads.json&style=flat-square"></a>

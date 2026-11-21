@@ -37,6 +37,7 @@ import argparse
 import ctypes
 import json
 import os
+import re
 import sys
 import time
 from ctypes import wintypes as wt
@@ -113,10 +114,13 @@ class AppWindow:
     exe: str  # the program's file name, lower case
     w: int  # client area size, in pixels
     h: int
+    xbox_owner_pid: int | None = None  # set only for a window the user explicitly identified as their Xbox stream
 
     @property
     def app(self) -> str:
         """What the app is called, for people: a known app's name, else its program name."""
+        if self.xbox_owner_pid is not None and self.exe not in PRESETS["xbox"][0]:
+            return "Selected Xbox stream"
         return KNOWN.get(self.exe, self.exe.removesuffix(".exe"))
 
 
@@ -167,11 +171,15 @@ def _api():
         except Exception:  # noqa: BLE001 - before Windows 10 1703
             pass
         u32.EnumWindows.argtypes = [ctypes.c_void_p, wt.LPARAM]
+        u32.EnumChildWindows.argtypes = [wt.HWND, ctypes.c_void_p, wt.LPARAM]
         for f in ("IsWindowVisible", "IsIconic", "IsWindow", "GetWindowTextLengthW"):
             getattr(u32, f).argtypes = [wt.HWND]
         u32.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+        u32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
         u32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
         u32.GetWindow.argtypes, u32.GetWindow.restype = [wt.HWND, wt.UINT], wt.HWND
+        u32.GetAncestor.argtypes, u32.GetAncestor.restype = [wt.HWND, wt.UINT], wt.HWND
+        u32.GetDesktopWindow.restype = u32.GetShellWindow.restype = wt.HWND
         u32.FindWindowExW.argtypes, u32.FindWindowExW.restype = [wt.HWND, wt.HWND, wt.LPCWSTR, wt.LPCWSTR], wt.HWND
         u32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
         u32.GetClientRect.argtypes = [wt.HWND, ctypes.POINTER(_RECT)]
@@ -204,23 +212,30 @@ def _exe_of(hwnd: int, cache: dict) -> str:
 
 
 def _hosted_exe(frame: int, cache: dict) -> str:
-    """The app inside a Store app's frame (STORE_FRAME): the program of its CoreWindow, or of the first child window
-    another process owns. "" when there's none: the app is suspended, minimised or closing (Windows takes its window
-    out of the frame then)."""
+    """Resolve the process drawing in a Store frame, including nested app windows."""
     u32, _, _ = _api()
     child = u32.FindWindowExW(frame, None, "Windows.UI.Core.CoreWindow", None)
     if child:
-        return _exe_of(child, cache)
-    host = _exe_of(frame, cache)
-    child = u32.FindWindowExW(frame, None, None, None)
-    for _ in range(64):  # a frame has a handful of children; the cap only guards against a loop
-        if not child:
-            break
         exe = _exe_of(child, cache)
-        if exe and exe != host:
+        if exe and exe != STORE_FRAME:
             return exe
-        child = u32.FindWindowExW(frame, child, None, None)
-    return ""
+
+    # The first child can belong to Windows or a rendering helper. A stream can own a grandchild.
+    candidate = ""
+
+    @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    def each(child, _):
+        nonlocal candidate
+        exe = _exe_of(child, cache)
+        if exe in PRESET_EXES:
+            candidate = exe
+            return False
+        if not candidate and exe and exe != STORE_FRAME:
+            candidate = exe
+        return True
+
+    u32.EnumChildWindows(frame, each, 0)
+    return candidate
 
 
 def client_rect(hwnd: int) -> Rect | None:
@@ -287,6 +302,13 @@ def exclude_from_capture(hwnd: int) -> bool:
 
 
 # ----------------------------------------------------------------------------- finding the window
+def _is_cloaked(dwm, hwnd: int) -> bool:
+    """DWM can hide a visible window on another desktop. Some sessions do not report this attribute."""
+    cloaked = wt.DWORD()
+    hr = dwm.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))  # DWMWA_CLOAKED
+    return hr == 0 and bool(cloaked.value)
+
+
 def find_windows(left_out: dict | None = None) -> list[AppWindow]:
     """Top-level windows that could be a game stream: visible, not minimised away from view, big enough, not a
     tool window or part of Windows' shell, and not this process's own. A Store app's frame counts as the app inside
@@ -317,9 +339,7 @@ def find_windows(left_out: dict | None = None) -> list[AppWindow]:
             exe = _hosted_exe(hwnd, exes)
         if not exe or exe in SKIP_EXE:
             return True
-        cloaked = wt.DWORD()
-        dwm.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))  # DWMWA_CLOAKED
-        if cloaked.value:
+        if _is_cloaked(dwm, hwnd):
             note(exe, "on another desktop, or not shown yet")
             return True
         n = u32.GetWindowTextLengthW(hwnd)
@@ -347,10 +367,53 @@ def find_windows(left_out: dict | None = None) -> list[AppWindow]:
     return sorted(found, key=lambda w: (w.exe not in KNOWN, w.exe not in PRESET_EXES, w.app.lower()))
 
 
+def _window_pid(u32, hwnd: int) -> int:
+    pid = wt.DWORD()
+    u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
+
+
+def _selected_xbox(query: str) -> AppWindow | None:
+    """Revalidate the top-level window the user selected. Its owner PID is the frame host's for Store apps."""
+    match = re.fullmatch(r"xbox-hwnd:([0-9]{1,20}):([0-9]{1,10})", query, re.IGNORECASE)
+    if match is None:
+        return None
+    hwnd, pid = map(int, match.groups())
+    if not 0 < hwnd < (1 << (8 * ctypes.sizeof(wt.HWND))) or not 0 < pid <= 0xffffffff or pid == os.getpid():
+        return None
+    u32, _, dwm = _api()
+    if (not u32.IsWindow(hwnd) or _window_pid(u32, hwnd) != pid or u32.GetAncestor(hwnd, 2) != hwnd
+            or hwnd in (u32.GetDesktopWindow(), u32.GetShellWindow()) or not u32.IsWindowVisible(hwnd)
+            or u32.IsIconic(hwnd)):
+        return None
+    if _is_cloaked(dwm, hwnd):
+        return None
+    r = client_rect(hwnd)
+    if r is None or r.w < MIN_SIZE[0] or r.h < MIN_SIZE[1]:
+        return None
+    window_class = ctypes.create_unicode_buffer(256)
+    u32.GetClassNameW(hwnd, window_class, len(window_class))
+    if window_class.value.lower() in ("progman", "workerw", "shell_traywnd", "shell_secondarytraywnd"):
+        return None
+    exes = {}
+    exe = _exe_of(hwnd, exes)
+    if exe == STORE_FRAME:
+        exe = _hosted_exe(hwnd, exes) or STORE_FRAME
+    if (exe in SKIP_EXE and exe != STORE_FRAME) or exe in ("smoovplay-setup.exe", "smoovplay-xbox-web-setup.exe"):
+        return None
+    title = ctypes.create_unicode_buffer(u32.GetWindowTextLengthW(hwnd) + 1)
+    u32.GetWindowTextW(hwnd, title, len(title))
+    return AppWindow(hwnd, title.value, exe, r.w, r.h, xbox_owner_pid=pid)
+
+
 def pick(query: str, windows: list[AppWindow] | None = None) -> AppWindow | None:
     """The window `query` names: "hwnd:N", "exe:NAME", a preset ("ps-remote-play"), or part of a title. Of several
     matches, the biggest. Several queries split by "|" are tried in turn: the launcher passes "hwnd:N|exe:NAME", so
-    an app reopened since its list was read is still found."""
+    an app reopened since its list was read is still found. "xbox-hwnd:HWND:PID" pins a user's explicit selection
+    to one top-level window and owner process (both decimal), independently of the app list."""
+    # An explicitly selected window is the entire query. Its disappearance must never select a different app.
+    if any(q.strip().lower().startswith("xbox-hwnd:") for q in query.split("|")):
+        return _selected_xbox(query.strip())
     windows = find_windows() if windows is None else windows
     if "|" in query:
         return next((w for q in query.split("|") if q.strip() and (w := pick(q, windows))), None)
@@ -414,7 +477,7 @@ class WindowSource:
         given), False uses the CPU path only."""
         from .sources import source_info
         self.target = target
-        self.xbox_window = target.exe in PRESETS["xbox"][0]
+        self.xbox_window = target.xbox_owner_pid is not None or target.exe in PRESETS["xbox"][0]
         self._open = open_fn or _open_lavfi
         self._open_gpu = gpu or (_open_dda if gpu is None and open_fn is None and _cuda() else None)
         self._said_path = ""
@@ -433,7 +496,7 @@ class WindowSource:
         self._stop = False
         self._container = None
         self.path = "GPU" if self._open_gpu else "CPU"
-        print(f"[window] {target.app} ({target.exe}): encoded stream size and received video Mbps unavailable "
+        print(f"[window] {target.app} ({target.exe or 'process name unavailable'}): encoded stream size and received video Mbps unavailable "
               "on stock window capture")
         self._log_geometry()
 
@@ -489,6 +552,10 @@ class WindowSource:
                 for got in self._frames():
                     now = time.perf_counter()
                     if self._stop:
+                        return
+                    if (self.target.xbox_owner_pid is not None
+                            and _window_pid(u32, self.target.hwnd) != self.target.xbox_owner_pid):
+                        print("[window] the selected Xbox stream window closed; select it again after reopening it")
                         return
                     if got is not None:
                         frame, t_arrival, t_source = got
@@ -602,6 +669,9 @@ def open_window(query: str, processing: str = "1080p") -> WindowSource:
     """--window QUERY: the window, or a clear error naming what was looked for."""
     target = pick(query)
     if target is None:
+        if query.strip().lower().startswith("xbox-hwnd:"):
+            raise RuntimeError("the selected Xbox stream window is unavailable: restore the stream on this desktop "
+                               "and select its window again")
         raise RuntimeError(f"no app window matches {query!r}: open the app and start streaming, then press Play again "
                            "(python -m framegen.window --list shows what's found)")
     return WindowSource(target, size={"1080p": SIZE, "native": None}[processing])

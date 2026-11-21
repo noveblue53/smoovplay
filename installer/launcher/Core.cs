@@ -952,8 +952,13 @@ namespace SmoovPlay
             if (kind == "capture")
                 return "--source capture --capture " + Quote(Environment.GetEnvironmentVariable("SMOOVPLAY_CAPTURE") ?? video ?? "0")
                        + (audio != null ? " --capture-audio " + Quote(audio) : "");
-            if (kind == "window")  // video: the app's window, as AppWindows.Query gives it
-                return "--source window --window " + Quote(Environment.GetEnvironmentVariable("SMOOVPLAY_WINDOW") ?? video ?? (Paths.XboxBuild ? "xbox" : "ps-remote-play"));
+            if (kind == "window")
+            {
+                // A foreground pick explicitly identifies this HWND and its owner for this session.
+                string window = video != null && video.StartsWith("xbox-hwnd:", StringComparison.Ordinal) ? video
+                    : Environment.GetEnvironmentVariable("SMOOVPLAY_WINDOW") ?? video ?? (Paths.XboxBuild ? "xbox" : "ps-remote-play");
+                return "--source window --window " + Quote(window);
+            }
             if (kind == "tap")  // SMOOVPLAY_TAP: another shared-memory name (docs/frame-tap.md)
                 return "--source tap" + (Environment.GetEnvironmentVariable("SMOOVPLAY_TAP") != null
                                          ? " --tap " + Quote(Environment.GetEnvironmentVariable("SMOOVPLAY_TAP")) : "");
@@ -1542,15 +1547,17 @@ namespace SmoovPlay
             get { return Environment.GetEnvironmentVariable("SMOOVPLAY_PREFS") ?? Path.Combine(Paths.SettingsDir, "smoovplay-launcher.txt"); }
         }
 
+        static bool Durable(string flag) { return !Paths.XboxBuild || !flag.StartsWith("window-hwnd:", StringComparison.Ordinal); }
+
         public static HashSet<string> Load()
         {
-            try { return new HashSet<string>(File.ReadAllLines(File_).Select(l => l.Trim()).Where(l => l.Length > 0)); }
+            try { return new HashSet<string>(File.ReadAllLines(File_).Select(l => l.Trim()).Where(l => l.Length > 0 && Durable(l))); }
             catch (Exception) { return new HashSet<string>(); }
         }
 
         public static void Save(HashSet<string> flags)
         {
-            try { Directory.CreateDirectory(Path.GetDirectoryName(File_)); File.WriteAllLines(File_, flags.OrderBy(f => f)); }
+            try { Directory.CreateDirectory(Path.GetDirectoryName(File_)); File.WriteAllLines(File_, flags.Where(Durable).OrderBy(f => f)); }
             catch (Exception) { }
         }
 

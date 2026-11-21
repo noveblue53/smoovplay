@@ -33,7 +33,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-VERSION = "0.3.11-xbox.1"  # a pre-release sorts before its release: 0.1.0-beta.2 and 0.1.0 both show as updates
+VERSION = "0.3.11-xbox.2"  # a pre-release sorts before its release: 0.1.0-beta.2 and 0.1.0 both show as updates
 # "owner/name" of the GitHub repo whose releases the launcher checks for updates; empty turns the check off
 RELEASES_REPO = "noveblue53/smoovplay"
 SIGNING_KEY = Path(os.environ.get("SMOOVPLAY_SIGNING_KEY") or Path.home() / ".smoovplay-xbox" / "update-signing-key.xml")
