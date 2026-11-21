@@ -26,6 +26,22 @@ def test_60fps_section_passes_through_one_tick_late():
     assert run("NdNNNNdNd") == [C, C, I, P, P, P, C, I, C]
 
 
+def test_xbox_menu_shows_every_original_and_drains_on_first_spare_beat():
+    sched = CadenceScheduler(live_native_60=True)
+    step = lambda pattern: [sched.step(c == "N") for c in pattern]
+    assert step("NdNd") == [C, C, I, C]
+    # A clean 30->60 transition has an original queued. Show every one in order
+    # until the first repeat catches up, then show new native frames immediately.
+    assert step("NNNNNNd") == [I, P, P, P, P, P, C]
+    assert step("NNNNNN") == [C] * 6
+    assert step("dNdNdN") == [C, C, C, I, C, I]
+
+
+def test_xbox_native_60_start_has_no_interpolation_or_lookahead():
+    sched = CadenceScheduler(live_native_60=True)
+    assert all(sched.step(True) is C for _ in range(180))
+
+
 def test_scene_cut_holds_instead_of_interpolating():
     assert run("NdNdNd", cuts="2") == [C, C, H, C, I, C]
 

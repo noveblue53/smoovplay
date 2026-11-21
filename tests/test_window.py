@@ -15,6 +15,13 @@ MON = Rect(0, 0, 2560, 1440)
 OUTPUTS = ["\\\\.\\DISPLAY1", "\\\\.\\DISPLAY2"]
 
 
+@pytest.fixture(autouse=True)
+def desktop_standins(monkeypatch):
+    # The stubs call the EnumWindows callback from Python. On Linux, ctypes only provides CFUNCTYPE.
+    if not hasattr(window.ctypes, "WINFUNCTYPE"):
+        monkeypatch.setattr(window.ctypes, "WINFUNCTYPE", window.ctypes.CFUNCTYPE, raising=False)
+
+
 # ----------------------------------------------------------------------------- where to grab
 def test_grab_is_the_picture_area_relative_to_its_monitor():
     second = Rect(2560, 0, 1920, 1080)
@@ -438,13 +445,69 @@ def test_to_bgr_scales_on_the_gpu_or_cpu():
     assert to_bgr(bgra, 1280, 720).shape == (720, 1280, 3)
 
 
-def test_open_window_scales_to_the_streams_size(monkeypatch):
+def test_open_window_defaults_to_1080p_processing(monkeypatch):
     _Desk(monkeypatch)
     monkeypatch.setattr(window, "pick", lambda q: WINDOWS[0])
     monkeypatch.setattr(window, "_cuda", lambda: False)
     src = window.open_window("ps-remote-play")
     assert (src.w, src.h) == window.SIZE == (1920, 1080)
 
+
+def test_process_captured_pixels_at_starting_region_size(monkeypatch):
+    desk = _Desk(monkeypatch)
+    desk.rects[0] = MON
+    monkeypatch.setattr(window, "pick", lambda q: WINDOWS[1])
+    monkeypatch.setattr(window, "_cuda", lambda: False)
+    src = window.open_window("xbox", processing="native")
+    assert (src.w, src.h) == (2560, 1440)
+    assert "scale=" not in graph(src._grab, src.w, src.h)
+
+    # The engine and output buffers have a fixed shape. Resizing the source after Play changes the grab and
+    # the overlay, while the next Play adopts the new visible even-sized crop.
+    desk.rects[0] = Rect(-20, 40, 1025, 769)
+    assert src._moved()
+    assert src.where()[0] == Rect(0, 40, 1004, 768)
+    assert (src.w, src.h) == (2560, 1440)
+    assert "scale=2560:1440" in graph(src._grab, src.w, src.h)
+    restarted = window.open_window("xbox", processing="native")
+    assert (restarted.w, restarted.h) == (1004, 768)
+
+
+def test_native_gpu_capture_preserves_pixel_detail_and_owns_frame():
+    from framegen.dda import to_bgr
+    bgra = torch.randint(256, (1440, 2560, 4), dtype=torch.uint8)
+    bgr = to_bgr(bgra, 2560, 1440)
+    assert bgr.is_contiguous() and torch.equal(bgr, bgra[..., :3])
+    bgra.zero_()  # the next DXGI copy reuses this buffer
+    assert torch.count_nonzero(bgr) > 0
+
+
+def test_refresh_change_updates_capture_even_at_same_window_position(monkeypatch, capsys):
+    desk = _Desk(monkeypatch)
+    src = WindowSource(WINDOWS[1], open_fn=desk.open)
+    monkeypatch.setattr(window, "monitor_of", lambda h: (MON, OUTPUTS[0], 144))
+    assert src._moved() and src._grab.hz == 144 and not src._moved()
+    printed = capsys.readouterr().out
+    assert "monitor 1 2560x1440 at 144 Hz, captured region 1280x720, processing 1280x720" in printed
+    assert "encoded stream size and received video Mbps unavailable on stock window capture" in printed
+
+
+@pytest.mark.parametrize("extra, expected", [([], "native"), (["--window-processing", "1080p"], "1080p")])
+def test_window_processing_cli_overrides_saved_choice_only_for_this_run(monkeypatch, tmp_path, extra, expected):
+    import run
+    path = tmp_path / "settings.json"
+    path.write_text('{"window_processing": "native"}')
+    monkeypatch.setattr(run.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(run.sys, "argv", ["run.py", "--source", "window", "--window", "xbox",
+                                         "--settings", str(path), *extra])
+
+    def stop_after_open(query, processing):
+        assert (query, processing) == ("xbox", expected)
+        raise RuntimeError("test window unavailable")
+
+    monkeypatch.setattr(window, "open_window", stop_after_open)
+    assert run.main() == 1
+    assert run.Settings.load(path).window_processing == "native"
 
 
 def test_a_running_streaming_app_left_off_the_list_says_why(monkeypatch):

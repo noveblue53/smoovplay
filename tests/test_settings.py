@@ -181,7 +181,7 @@ def test_menu_disabled_row_and_restart_row():
     m.index = _keys(m).index("fsr_sharpness")
     m.key("right")
     assert st.fsr_sharpness == BY_KEY["fsr_sharpness"].default  # greyed out: no change
-    assert _keys(m) == ["scaler", "fsr_sharpness", "hdr", "capture_size"]  # RTX VSR quality: hidden
+    assert _keys(m) == ["scaler", "fsr_sharpness", "hdr", "capture_size", "window_processing"]
     pending.append("AI engine")
     assert m.rows()[-1][0] == "restart"
     m.index = len(m.rows()) - 1
@@ -416,7 +416,10 @@ def test_settings_for_one_source_say_why_not_with_the_others():
     size, mini = BY_KEY["capture_size"], BY_KEY["minimize_chiaki"]
     assert size.unused_with("capture") is None and mini.unused_with("chiaki") is None
     assert "1080p at most" in size.unused_with("chiaki")  # Remote Play: greyed out, and why
-    assert "1080p" in size.unused_with("window") and "own size" in size.unused_with("tap")
+    assert "Window processing" in size.unused_with("window") and "own size" in size.unused_with("tap")
+    processing = BY_KEY["window_processing"]
+    assert not processing.live and processing.default == "1080p"
+    assert processing.unused_with("window") is None and processing.unused_with("capture")
     assert size.unused_with("file") == "Only used with a capture card."
     assert mini.unused_with("tap") == mini.unused_with("capture") == "Only used with PS5 Remote Play."
     assert BY_KEY["fill"].unused_with("tap") is None  # most settings: every source

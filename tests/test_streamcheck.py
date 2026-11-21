@@ -165,3 +165,16 @@ def test_size_detector_reports_its_reference():
         d.update(50_000, False)
     d.update(1_000_000, False)  # far bigger than anything recent: treated as a keyframe
     assert d.big and d.ref is None
+
+
+def test_received_video_mbps_counts_payload_before_decoding_and_reports_incomplete_taps():
+    sc = StreamCheck()
+    sc.payload.add(1, 7, 1.0, 12345, False)  # left edge of the first measured interval
+    sc.payload.add(1, 8, 1.5, 500_000, False)
+    sc.payload.add(1, 8, 1.5, 500_000, False)  # a held slot read twice
+    sc.payload.add(2, 0, 100.0, 54321, False)  # a new session: leave out the disconnected time
+    sc.payload.add(2, 1, 100.5, 500_000, False)
+    assert sc.report() == ["Received video payload: 8.00 Mbps over 1.00 s at the compressed tap"]
+    sc.payload.add(2, 3, 101.5, 125_000, True)
+    assert sc.report() == ["Received video payload: 4.50 Mbps over 2.00 s at the compressed tap"
+                           " (lower bound: 1 skipped slots, 1 truncated)"]

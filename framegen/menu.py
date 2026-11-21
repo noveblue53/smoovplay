@@ -228,7 +228,8 @@ class Menu:
                             cv2.LINE_AA)
                 tag_x += cv2.getTextSize("experimental", FONT, small * 0.9, th)[0][0] + px(10)
             if not spec.live:
-                cv2.putText(img, "restart", (tag_x, base), FONT, small * 0.9, DIM if off else MUTED,
+                when = "next Play" if spec.key == "window_processing" else "restart"
+                cv2.putText(img, when, (tag_x, base), FONT, small * 0.9, DIM if off else MUTED,
                             th, cv2.LINE_AA)
             value = "not available" if off else spec.name(getattr(self.settings, spec.key))
             right = w - pad

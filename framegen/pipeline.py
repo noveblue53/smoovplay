@@ -375,7 +375,8 @@ class Pipeline:
         self.waiting = None  # the source's Waiting while no frame is coming, else None (the watchdog reads it too)
 
     def run(self, source, sink=None, enabled: bool = True, score: bool = False, label: str = "",
-            on_tick=None, hz: int = 60, settings=None, gt=None, remote=None, replay=None) -> Stats:
+            on_tick=None, hz: int = 60, settings=None, gt=None, remote=None, replay=None, trace=None,
+            live_native_60: bool = False) -> Stats:
         """on_tick(tick, diff, action, proc_ms, t_start), if given, is called after each tick is processed.
         remote: the source, when it can press a button for the delay test (L: PS5 Remote Play's chiaki-ng,
         framegen.chiaki_tap.ChiakiSource) or hold its sound back to meet the picture (settings.audio_sync: chiaki-ng,
@@ -395,7 +396,8 @@ class Pipeline:
         """
         if settings is not None:
             enabled, hz = settings.interp, settings.hz if sink is not None else 60
-        it, sched, st = self.interp, CadenceScheduler(), Stats(private=bool(getattr(self.interp, "private", False)))
+        it, sched = self.interp, CadenceScheduler(live_native_60)
+        st = Stats(private=bool(getattr(it, "private", False)))
         steady = None  # Steady HUD as last applied to the interpolator (followed live from settings)
         self.stats = st
         quarter_due = False  # 120 Hz: the previous tick interpolated, so this repeat tick owes the 3/4 frame
@@ -540,7 +542,8 @@ class Pipeline:
                 if settings.simulate_30:
                     st.simulated += 1
                 if settings.interp != enabled:
-                    enabled, sched, quarter_due, ov_next = settings.interp, CadenceScheduler(), False, 0.0
+                    enabled, sched = settings.interp, CadenceScheduler(live_native_60)
+                    quarter_due, ov_next, unshown = False, 0.0, None
                     print(f"[pipeline] interpolation {'ON' if enabled else 'OFF'}")
                 if settings.steady_hud != steady:
                     steady = settings.steady_hud
@@ -666,7 +669,16 @@ class Pipeline:
                 # A frame the source flags as damaged (e.g. Remote Play packet loss) is held like a cut, so its
                 # corruption isn't blended into the generated frame. `|` so the cut detector still sees every frame.
                 is_cut = is_new and (cuts.update(diff.mean_diff, diff.cut) | tick.damaged)
-                action = sched.step(is_new, is_cut)
+                # On the Xbox app's established 30 Hz cadence, the adaptive detector can lag
+                # a native menu transition. A fresh capture it calls a repeat despite a whole-
+                # image mean above even the fixed block-maximum threshold is ambiguous. An
+                # unchanged image, a clock hold and the ordinary single coded repeat cannot
+                # switch us into native passthrough.
+                moving_repeat = (live_native_60 and hz == 60 and not is_new and tick.new_hint is None and rhythm is None
+                                 and diff.mean_diff > self.detector.threshold)
+                if moving_repeat and sched.moving_repeat:
+                    moving_repeat = 28 <= (seen_rate.fps() or 0) <= 32
+                action = sched.step(is_new, is_cut, moving_repeat)
                 timeline.set_at_arrival(dipping)
                 added = timeline.tick(is_new, is_cut, tick.frame, tick.t_arrival)
                 was_timed = timed
@@ -688,7 +700,7 @@ class Pipeline:
                             sink.toast(f"Game at about {timeline.fps()} fps: SmoovPlay is spacing its frames evenly "
                                        "(Even out 40-60 fps)", 6.0)
                     else:
-                        sched = CadenceScheduler()  # starts afresh, from the next new frame
+                        sched = CadenceScheduler(live_native_60)  # starts afresh, from the next new frame
                         action = sched.step(is_new, is_cut)
                         print("[pipeline] even timing off")
                 if is_new and not timed:
@@ -799,13 +811,17 @@ class Pipeline:
             if sink is not None:
                 st.sink_ms.append((t_shown - t_ready) * 1000)
 
+            if trace is not None:
+                trace.tick(tick, hz, is_new, action.value, t0, t_ready, mid_t, pl if timed else None)
+
             # Track when each real frame first reaches the screen (timed: when the game time shown reaches it).
             if timed:
                 st.real_delay_ms.extend((t_shown - f.t_arrival) * 1000 for f in reached)
                 reached = ()
-            elif action is Action.PENDING and unshown is not None:
-                st.real_delay_ms.append((t_shown - unshown) * 1000)
-                unshown = None
+            elif action is Action.PENDING:
+                if unshown is not None:
+                    st.real_delay_ms.append((t_shown - unshown) * 1000)
+                unshown = tick.t_arrival  # previous original shown, current original still due
             elif is_new:
                 if action is Action.CURRENT:
                     st.real_delay_ms.append((t_shown - tick.t_arrival) * 1000)
@@ -848,7 +864,7 @@ class Pipeline:
                         settings.override("interp", not settings.interp)  # picked up at the next tick
                     else:
                         enabled = not enabled
-                        sched = CadenceScheduler()
+                        sched = CadenceScheduler(live_native_60)
                         print(f"[pipeline] interpolation {'ON' if enabled else 'OFF'}")
 
         st.wall_s = time.perf_counter() - t_start

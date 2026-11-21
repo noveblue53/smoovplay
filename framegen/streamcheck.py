@@ -41,10 +41,41 @@ def _pct(n: int, d: int) -> str:
     return f"{100 * n / d:.1f}%" if d else "n/a"
 
 
+class VideoPayloadRate:
+    """Bytes read from compressed tap slots, before decoder or display drops. Start each session
+    at its first arrival: its first payload precedes the measured interval. Gaps leave a lower bound.
+    """
+
+    def __init__(self) -> None:
+        self.session = self.seq = self.last = None
+        self.bytes = self.gaps = self.truncated = 0
+        self.seconds = 0.0
+
+    def add(self, session: int, seq: int, t: float, size: int, truncated: bool) -> None:
+        if session == self.session and seq <= self.seq:
+            return  # a slot held while the decoder starts can be read twice
+        if session == self.session:
+            self.bytes += size
+            self.gaps += seq - self.seq - 1
+            self.truncated += int(truncated)
+            self.seconds += max(0.0, t - self.last)
+            t = max(self.last, t)  # near-simultaneous arrivals can round the other way
+        self.session, self.seq, self.last = session, seq, t
+
+    def report(self) -> str:
+        if self.seconds <= 0:
+            return ""
+        lower = f" (lower bound: {self.gaps} skipped slots, {self.truncated} truncated)" if (
+            self.gaps or self.truncated) else ""
+        rate = self.bytes * 8 / (self.seconds * 1e6)
+        return f"Received video payload: {rate:.2f} Mbps over {self.seconds:.2f} s at the compressed tap{lower}"
+
+
 class StreamCheck:
     """Collects one row per Remote Play frame the pipeline saw; report() turns them into plain-language lines."""
 
     def __init__(self, max_ticks: int = MAX_TICKS) -> None:
+        self.payload = VideoPayloadRate()
         self.max_ticks = max_ticks
         self.t = array("d")         # arrival, s
         self.seq = array("q")       # the tap's frame number: a jump means frames never reached the pipeline
@@ -86,8 +117,9 @@ class StreamCheck:
     # ------------------------------------------------------------------------------------------------- report
     def report(self) -> list[str]:
         n = len(self.t)
+        bitrate = self.payload.report()
         if n < 2:
-            return []
+            return [bitrate] if bitrate else []
         t = np.frombuffer(self.t, dtype=np.float64)
         seq = np.frombuffer(self.seq, dtype=np.int64)
         size = np.frombuffer(self.size, dtype=np.int64)
@@ -103,6 +135,9 @@ class StreamCheck:
                  + (" (the first 30 minutes; later frames weren't recorded)" if self.extra else "")]
         if self.simulated:
             lines[0] += f"; {_mmss(self.simulated * TICK_MS / 1000)} with \"Simulate a 30 fps game\" on left out"
+
+        if bitrate:
+            lines.append(bitrate)
 
         # Frame rates, per whole second of play.
         edges = t[0] + np.arange(int(span) + 1)

@@ -1,5 +1,6 @@
 """scripts/latency_video.py on made-up slow-motion videos with known delays. CPU only."""
 import importlib.util
+import weakref
 from pathlib import Path
 
 import cv2
@@ -91,3 +92,49 @@ def test_letting_go_of_the_button_isnt_a_new_press():
     starts = [10, 25, 26, 400, 412]
     assert lv.presses_of(starts, 240) == [10, 400]
     assert lv.pair([10, 400], [5, 40, 41, 300, 450], 240) == [(10, 40), (400, 450)]
+
+
+def test_hundred_press_clip_reports_tail_and_limits_contact_sheet(tmp_path, monkeypatch, capsys):
+    # A streamed 100-second camera fixture. Ninety presses take 24 frames, ten take 48.
+    # A hundredth matched press is outside the contact sheet but must count toward p95.
+    videos = []
+
+    class Video:
+        def __init__(self, path):
+            self.n, self.live = 0, []
+            videos.append(self)
+
+        def isOpened(self):
+            return True
+
+        def get(self, prop):
+            return FPS
+
+        def read(self):
+            if self.n == 100 * FPS:
+                return False, None
+            press, phase = divmod(self.n, FPS)
+            frame = np.zeros((8, 16, 3), np.uint8)
+            if 12 <= phase < 22:
+                frame[:, :8] = 220
+            delay = 24 if press < 90 else 48
+            if 12 + delay <= phase < 12 + delay + 50:
+                frame[:, 8:] = 180
+            self.n += 1
+            self.live = [ref for ref in self.live if ref() is not None]
+            assert len(self.live) <= 1  # neither pass retains old decoded camera frames
+            self.live.append(weakref.ref(frame))
+            return True, frame
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(lv.cv2, "VideoCapture", Video)
+    path = tmp_path / "long.mov"
+    assert lv.main(["press", str(path), "--button", "0,0,8,8", "--screen", "8,0,8,8"]) == 0
+    out = capsys.readouterr().out
+    assert "matched: 100" in out and "median 100 ms, p95 200 ms" in out
+    assert "First 20 matched presses" in out
+    measured, sheet = videos
+    assert measured.n == 100 * FPS
+    assert sheet.n == 19 * FPS + 12 + 24 + 1

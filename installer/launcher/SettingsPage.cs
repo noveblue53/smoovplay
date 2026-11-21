@@ -439,14 +439,15 @@ namespace SmoovPlay
             }
             if (!spec.Live)
             {
+                bool nextPlay = spec.Key == "present" || spec.Key == "window_processing";
                 row.RestartTag = new Border
                 {
                     CornerRadius = new CornerRadius(8), BorderBrush = R("Line2"), BorderThickness = new Thickness(1), Padding = new Thickness(7, 1, 7, 2),
                     Margin = new Thickness(10, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center, Visibility = Visibility.Collapsed,
-                    // Window presentation is read when the video window opens; Restart now only rebuilds the AI engine
-                    ToolTip = spec.Key == "present" ? "While playing, this one changes the next time you press Play."
-                                                    : "While playing, this one changes after a restart (Restart now, at the top).",
-                    Child = new TextBlock { Text = spec.Key == "present" ? "next Play" : "after a restart", FontSize = 10.5, Foreground = R("Muted") },
+                    // Restart now rebuilds the AI engine. Capture and presentation are opened at the next Play.
+                    ToolTip = nextPlay ? "While playing, this one changes the next time you press Play."
+                                       : "While playing, this one changes after a restart (Restart now, at the top).",
+                    Child = new TextBlock { Text = nextPlay ? "next Play" : "after a restart", FontSize = 10.5, Foreground = R("Muted") },
                 };
                 title.Children.Add(row.RestartTag);
             }

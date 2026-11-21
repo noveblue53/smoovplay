@@ -654,6 +654,8 @@ class ChiakiSource:
                 else:
                     passed = True
                 continue
+            if going:
+                self.check.payload.add(session, p.seq, p.t_arrival, len(p.data), p.truncated)
             ps = param_sets(p.data, codec)
             if ps:
                 if ps != params:

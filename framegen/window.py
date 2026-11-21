@@ -15,12 +15,13 @@ How it works:
 - SmoovPlay's own window sits on top as a click-through overlay that never takes the focus (the app keeps it:
   some apps stop updating without it), and is left out of the capture (io.py, exclude_from_capture: Windows'
   WDA_EXCLUDEFROMCAPTURE, Windows 10 2004 or newer), so the capture sees the app underneath.
-- Frames come when the app draws, not on a fixed beat: run.py puts them on a 60 Hz beat (sources.Clock60). An app
-  decodes its own stream, so its repeats are never quite identical: they're told from new frames by a rule learned
-  from the last few frames (cadence.DuplicateDetector(learn=True)).
-- Frames are scaled to 1920x1080 (SIZE), whatever the window's size: the size Remote Play's stream has, so the
-  TensorRT engines setup builds are used (a new size would build one, about a minute) and the settings fit. The
-  overlay shows the result at the window's own size.
+- sources.Clock60 places captures on a 60 Hz beat. On a faster Xbox desktop, it follows the timing of recent
+  captures and can retain one more arrival when two compete for a beat. FFmpeg can recapture the identical Xbox
+  picture after a desktop change elsewhere. The clock discards those exact copies. The pipeline identifies
+  decoded repeats with compression differences using cadence.DuplicateDetector(learn=True).
+- Processing defaults to 1920x1080, the size of the TensorRT engines built by setup. Window processing = Captured
+  pixels uses the visible region's starting dimensions. The engine keeps that shape until the next session. The
+  app owns the compressed stream, so its encoded size and bitrate are unavailable here.
 - The window is looked at twice a second. If it moved or changed size, capture restarts there. If it's minimised,
   the last frame stays up until it's back.
 
@@ -39,7 +40,7 @@ import os
 import sys
 import time
 from ctypes import wintypes as wt
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 # Apps people stream games through, by program name: preset -> (its programs, what it's called). Browsers come with
 # no preset (a cloud game is one tab among many): pick their window from the list.
@@ -86,7 +87,9 @@ def capture_error(e: BaseException, ffmpeg: str = "") -> str:
         if code in low:
             return f"{text}: {words}"
     return text
-SIZE = (1920, 1080)  # what frames are scaled to, for the pipeline
+
+
+SIZE = (1920, 1080)  # default processing size, independent of the window and its stream
 
 
 @dataclass(frozen=True)
@@ -241,8 +244,8 @@ def monitor_of(hwnd: int) -> tuple[Rect, str, int]:
     r = mi.rcMonitor
     dm = _DEVMODE()
     dm.dmSize = ctypes.sizeof(dm)
-    hz = dm.dmDisplayFrequency if u32.EnumDisplaySettingsW(mi.szDevice, 0xFFFFFFFF, ctypes.byref(dm)) else 60  # current
-    return Rect(r.left, r.top, r.right - r.left, r.bottom - r.top), mi.szDevice, int(hz) if hz > 1 else 60
+    hz = dm.dmDisplayFrequency if u32.EnumDisplaySettingsW(mi.szDevice, 0xFFFFFFFF, ctypes.byref(dm)) else 0  # current
+    return Rect(r.left, r.top, r.right - r.left, r.bottom - r.top), mi.szDevice, int(hz) if hz > 1 else 0
 
 
 def _com(obj, index: int, *argtypes):
@@ -394,8 +397,9 @@ def graph(g: Grab, out_w: int, out_h: int) -> str:
     """The FFmpeg filter graph: Desktop Duplication of the region, only when the screen changes, to the CPU as BGR at
     the source's fixed size."""
     r = g.region
+    resize = "" if (r.w, r.h) == (out_w, out_h) else f"scale={out_w}:{out_h}:flags=bilinear,"
     return (f"ddagrab=output_idx={g.output}:framerate={g.hz}:video_size={r.w}x{r.h}:offset_x={r.x}:offset_y={r.y}"
-            f":draw_mouse=0:dup_frames=0,hwdownload,format=bgra,scale={out_w}:{out_h}:flags=bilinear,format=bgr24")
+            f":draw_mouse=0:dup_frames=0,hwdownload,format=bgra,{resize}format=bgr24")
 
 
 # ----------------------------------------------------------------------------- the source
@@ -410,9 +414,11 @@ class WindowSource:
         given), False uses the CPU path only."""
         from .sources import source_info
         self.target = target
+        self.xbox_window = target.exe in PRESETS["xbox"][0]
         self._open = open_fn or _open_lavfi
         self._open_gpu = gpu or (_open_dda if gpu is None and open_fn is None and _cuda() else None)
-        self._said_gpu = False
+        self._said_path = ""
+        self.trace_captures = False
         self._client = client_rect(target.hwnd)
         if self._client is None:
             raise RuntimeError(f"the {target.app} window is minimised: restore it, then press Play again")
@@ -420,15 +426,22 @@ class WindowSource:
         plan = plan_grab(self._client, mon, device, dda_outputs(), hz)
         if isinstance(plan, str):
             raise RuntimeError(f"can't capture the {target.app} window: {plan}")
-        self._grab, self._monitor = plan, mon
+        self._grab, self._monitor, self._device, self._hz = plan, mon, device, hz
         self.w, self.h = size or (plan.region.w, plan.region.h)
         self.info = source_info("window", name=f"{target.app} window", hz=float(hz))
         self.restarts = 0
         self._stop = False
         self._container = None
         self.path = "GPU" if self._open_gpu else "CPU"
-        print(f"[window] {target.app} ({target.exe}): {plan.region.w}x{plan.region.h} on monitor {plan.output + 1} "
-              f"at {hz} Hz, captured as {self.w}x{self.h}")
+        print(f"[window] {target.app} ({target.exe}): encoded stream size and received video Mbps unavailable "
+              "on stock window capture")
+        self._log_geometry()
+
+    def _log_geometry(self) -> None:
+        m, r = self._monitor, self._grab.region
+        refresh = f"{self._hz} Hz" if self._hz else "unknown refresh"
+        print(f"[window] monitor {self._grab.output + 1} {m.w}x{m.h} at {refresh}, "
+              f"captured region {r.w}x{r.h}, processing {self.w}x{self.h}")
 
     def where(self) -> tuple[Rect, Rect] | None:
         """Where the overlay goes: the part of the window's picture area that's captured (on its monitor, even
@@ -442,18 +455,21 @@ class WindowSource:
     def _moved(self) -> bool:
         """Re-reads the window's place; True if capture has to restart (moved, resized, or to another monitor)."""
         client = client_rect(self.target.hwnd)
-        if client == self._client:
-            return False
-        self._client = client
         if client is None:
-            return True
+            moved = self._client is not None
+            self._client = None
+            return moved
         mon, device, hz = monitor_of(self.target.hwnd)
+        if (client, mon, device, hz) == (self._client, self._monitor, self._device, self._hz):
+            return False
         plan = plan_grab(client, mon, device, dda_outputs(), hz)
         if isinstance(plan, str):
             print(f"[window] {plan}")
             self._client = None
             return True
-        self._grab, self._monitor = plan, mon
+        self._client, self._grab, self._monitor, self._device, self._hz = client, plan, mon, device, hz
+        self.info = replace(self.info, hz=float(hz))
+        self._log_geometry()
         return True
 
     def __iter__(self):
@@ -476,7 +492,10 @@ class WindowSource:
                         return
                     if got is not None:
                         frame, t_arrival, t_source = got
-                        yield Tick(frame, t_arrival, n, t_source=t_source, t_ready=time.perf_counter())
+                        tick = Tick(frame, t_arrival, n, t_source=t_source, t_ready=time.perf_counter())
+                        if self.trace_captures:
+                            tick.extra.update(window_seq=n, window_ready=tick.t_ready, window_backend=self.path)
+                        yield tick
                         n, good = n + 1, good + 1
                         if good >= 30:  # working again (a capture opened anew hands over a frame before failing)
                             fails, failing, said = 0, None, ""
@@ -514,11 +533,10 @@ class WindowSource:
         """(frame, t_arrival, t_source) each time the window's picture changes, from one capture (it ends for a
         restart); None now and then while nothing changes, so the window can be looked at."""
         if self._open_gpu is not None:
-            r = self._grab.region
             self._container = cap = self._open_gpu(self._grab, self.w, self.h)
-            if not self._said_gpu:
-                self._said_gpu = True
-                print(f"[window] capturing on the GPU ({r.w}x{r.h} -> {self.w}x{self.h})")
+            if self._said_path != self.path:
+                print("[window] capture backend: DXGI Desktop Duplication to CUDA")
+                self._said_path = self.path
             while not self._stop:
                 yield cap.grab(100)
         else:
@@ -530,6 +548,9 @@ class WindowSource:
             try:
                 with av.logging.Capture() as self._ffmpeg_logs:
                     self._container = self._open(graph(self._grab, self.w, self.h))
+                    if self._said_path != self.path:
+                        print("[window] capture backend: FFmpeg ddagrab to CPU")
+                        self._said_path = self.path
                     for frame in self._container.decode(video=0):
                         yield frame.to_ndarray(), time.perf_counter(), frame.time
             finally:
@@ -577,13 +598,13 @@ def _cuda() -> bool:
         return False
 
 
-def open_window(query: str) -> WindowSource:
+def open_window(query: str, processing: str = "1080p") -> WindowSource:
     """--window QUERY: the window, or a clear error naming what was looked for."""
     target = pick(query)
     if target is None:
         raise RuntimeError(f"no app window matches {query!r}: open the app and start streaming, then press Play again "
                            "(python -m framegen.window --list shows what's found)")
-    return WindowSource(target, size=SIZE)
+    return WindowSource(target, size={"1080p": SIZE, "native": None}[processing])
 
 
 # ----------------------------------------------------------------------------- command line

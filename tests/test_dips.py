@@ -73,6 +73,54 @@ def _backward_steps(shown):
     return sum(1 for a, b in zip(shown, shown[1:]) if b < a - 1e-6)
 
 
+def test_consecutive_pending_originals_each_get_a_delay_sample():
+    def source():
+        # Force a midpoint, six back-to-back new frames, then a spare beat to drain.
+        for i, frame in enumerate([0, 0, 1, 2, 3, 4, 5, 6, 7, 7]):
+            yield Tick(torch.full((8, 8, 3), float(frame)), time.perf_counter(), i,
+                       new_hint=i not in (1, 9))
+
+    sink = _Sink()
+    stats = _pipeline(_Interp()).run(source(), sink, live_native_60=True)
+    assert sink.shown == [0, 0, 0.5, 1, 2, 3, 4, 5, 6, 7]
+    assert len(stats.real_delay_ms) == 8  # every original 0 through 7 was shown
+
+
+def test_xbox_menu_does_not_interpolate_from_behind_an_already_displayed_frame():
+    from scripts.xbox_cadence_replay import fixture, replay
+
+    # The first native pictures move less per beat than a 30 fps source. Two
+    # get classified as repeats. Both nevertheless went to the display.
+    events = fixture('dda', monitor_hz=60, seed=40)
+    rows = replay(events[:1216], 'dda', enabled=True)
+    transition = rows[1198:1215]
+    assert rows[1201]['new'] is False and rows[1202]['new'] is False
+    assert _backward_steps([r['output'] for r in transition]) == 0
+    assert [r['output'] for r in rows[1202:1215]] == list(range(1202, 1215))
+
+
+def test_xbox_uncertain_repeats_maintain_interpolation_through_a_still_and_slow_scene():
+    def source():
+        # AABB through frame 139, a static pause, then 20 fps. At each
+        # repeated frame, add a small decoded residual to the whole screen.
+        for i in range(240):
+            if i < 140:
+                level = 2.5 * (i // 2) + 0.25 * (i % 2)
+            else:
+                motion = max(0, i - 180)
+                level = 175 + 3 * (motion // 3) + 0.25 * (i % 3)
+            yield Tick(torch.full((8, 8, 3), float(level)), time.perf_counter(), i)
+
+    shown = []
+    for xbox in (False, True):
+        sink = _Sink()
+        pipeline = _pipeline(_Interp())
+        pipeline.run(source(), sink, live_native_60=xbox)
+        shown.append(sink.shown)
+    assert len(shown[0]) == 240
+    assert shown[0] == shown[1]
+
+
 def test_the_30_fps_setting_never_steps_back_when_the_game_dips():
     for hz in (60, 90, 120):
         it, sink = _Interp(), _Sink()

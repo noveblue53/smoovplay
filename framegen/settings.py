@@ -231,9 +231,17 @@ SPECS: tuple[Spec, ...] = (
                  "speed": "1440p: about twice the work of 1080p. 4K: about four times. Both can run sluggish."},
          sources=("capture",),
          elsewhere={"chiaki": "Only used with a capture card. PS5 Remote Play streams 1080p at most.",
-                    "window": "Only used with a capture card. App window capture is scaled to 1080p.",
+                    "window": "Only used with a capture card. For an app, choose Window processing.",
                     "tap": "Only used with a capture card. The app sends its frames at its own size.",
                     "": "Only used with a capture card."}),
+    Spec("window_processing", "Window processing", ("1080p", "native"), "1080p",
+         {"1080p": "1080p", "native": "Captured pixels"}, live=False, group="Picture", sources=("window",),
+         elsewhere={"": "Only used with app window capture."},
+         hints={"1080p": "Process at 1920 x 1080, then use the selected upscaler for a larger output.",
+                "native": "Use the visible window's pixel dimensions at the start of play."},
+         help="Captured pixels keeps fine detail when the app draws it. A larger window costs more GPU time, and "
+              "TensorRT may build an engine for the new size on first use. Size the app before pressing Play. "
+              "Changes apply the next time you press Play. The app controls the stream resolution and bitrate."),
     # framegen/looks.py (the looks; "Which look" lists the built-in ones, then the user's, from looks.CHOICES, which
     # the looks library keeps up to date) and framegen/looks_gl.py (drawing them, after the upscaler).
     Spec("look_on", "Look", (False, True), False, ON_OFF, group="Looks",

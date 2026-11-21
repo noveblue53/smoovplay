@@ -8,11 +8,11 @@ exported slow-motion clip can be retimed. If the file says 30 fps but was filmed
 
 press: film the controller and the screen together. Rest your thumb on the button and press it from there, so the
   only movement in the button's box is the press. Use something that reacts at once and the same way each time, on
-  a still part of the picture: in a 30 fps game, standing still, the pause menu (Options) is good. (The PS button's
-  control centre is drawn at 60 fps over the game, so with frame generation on it passes straight through and
-  misses SmoovPlay's delay.) Press 10-15 times, a second or more apart. Reported: each press's delay and the
-  median. Compare setups by filming each: the PS5 straight into the screen, chiaki-ng on its own, SmoovPlay with
-  frame generation off (I), and on.
+  a still part of the picture, such as a flashlight toggled against a wall. For a 30 fps game use a response
+  drawn during 30 fps gameplay. Console overlays and some game menus run at 60 fps. Space presses at least a
+  second apart. For a tail estimate, aim for 100 matched
+  presses per setup. The report gives each matched delay, the median and p95. For Xbox Remote Play, film the
+  same action with the Xbox app alone, then SmoovPlay with frame generation off and on.
 side: film two screens showing the same game: the PS5's own HDMI output and SmoovPlay (picture-by-picture on one
   monitor is best, as both halves then go through the same screen). Any motion works. Reported: how far behind
   the second box is, which is what Remote Play and SmoovPlay add to the picture. With frame generation on, the
@@ -20,7 +20,7 @@ side: film two screens showing the same game: the PS5's own HDMI output and Smoo
 
 The boxes are drawn with the mouse on the first frame (Enter or Space to confirm each), or given as x,y,w,h in
 pixels: --button and --screen for press, --a (the PS5's own output) and --b (SmoovPlay) for side. A picture of
-each press (the button as it starts, the screen before and as it changes) is saved next to the video, to check.
+the first 20 matched presses (button at onset, screen before and at reaction) is saved next to the video.
 """
 from __future__ import annotations
 
@@ -34,33 +34,42 @@ import numpy as np
 QUIET_FRAMES = 6  # an event starts after at least this many quiet camera frames
 MAX_DELAY_S = 0.6  # a screen change more than this long after a press isn't that press's
 MAX_LAG_S = 0.3  # side: the longest lag looked for
+SHEET_ROWS = 20
 
 
-def read_boxes(path: str, boxes: list[tuple[int, int, int, int]], every: int = 1) -> tuple[list[np.ndarray], float]:
-    """Each box's grey pixels in every frame of the video, as float32 arrays (frames, h, w), and the video's fps."""
+def read_boxes(path: str, boxes: list[tuple[int, int, int, int]], every: int = 1, *,
+               changes_only: bool = False) -> tuple[list[np.ndarray], float]:
+    """Grey pixels per box for side mode, or just the mean absolute changes per box for press mode, plus fps."""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         sys.exit(f"can't open {path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-    out: list[list[np.ndarray]] = [[] for _ in boxes]
+    out = [[] for _ in boxes]
+    previous = [None] * len(boxes)
     i = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if i % every == 0:
-            grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            for k, (x, y, w, h) in enumerate(boxes):
-                out[k].append(grey[y:y + h, x:x + w].astype(np.float32))
-        i += 1
-    cap.release()
-    return [np.stack(o) for o in out], fps
-
-
-def change(frames: np.ndarray) -> np.ndarray:
-    """How much a box changes from each frame to the next (mean absolute difference); 0 for the first frame."""
-    d = np.abs(np.diff(frames, axis=0)).mean(axis=(1, 2))
-    return np.concatenate([[0.0], d])
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if i % every == 0:
+                for k, (x, y, w, h) in enumerate(boxes):
+                    crop = frame[y:y + h, x:x + w]
+                    if not crop.size:
+                        sys.exit(f"box {(x, y, w, h)} is outside the {frame.shape[1]}x{frame.shape[0]} video")
+                    grey = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                    if changes_only:
+                        delta = 0.0 if previous[k] is None else cv2.norm(grey, previous[k], cv2.NORM_L1) / grey.size
+                        out[k].append(delta)
+                        previous[k] = grey
+                    else:
+                        out[k].append(grey.astype(np.float32))
+            i += 1
+    finally:
+        cap.release()
+    if not i:
+        sys.exit(f"no frames in {path}")
+    return [np.asarray(o) for o in out], fps
 
 
 def onsets(signal: np.ndarray, quiet: int = QUIET_FRAMES, k: float = 8.0) -> list[int]:
@@ -145,33 +154,43 @@ def parse_box(text: str | None):
     return tuple(int(v) for v in text.split(",")) if text else None
 
 
-def sheet(path: str, boxes, pairs, out: Path) -> None:
-    """One row per press: the button as the press starts, the screen just before it changes, and as it does."""
+def sheet(path: str, boxes, pairs, out: Path) -> int:
+    """Draw just the requested thumbnails into a bounded sheet as the decoder reaches them."""
+    pairs = pairs[:SHEET_ROWS]
     if not pairs:
-        return
-    want = {f for p, c in pairs for f in (p, c - 1, c)}
+        return 0
+    tile_w, tile_h, pad = 320, 160, 4
+    row_h, col_w = tile_h + 2 * pad, tile_w + 2 * pad
+    canvas = np.zeros((len(pairs), row_h, 3 * col_w, 3), np.uint8)
+    filled = np.zeros(len(pairs), np.uint8)
+    wanted = {}
+    for row, (press, change) in enumerate(pairs):
+        for col, n in enumerate((press, change - 1, change)):
+            wanted.setdefault(n, []).append((row, col))
     cap = cv2.VideoCapture(path)
-    frames, i = {}, 0
-    while want - frames.keys():
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if i in want:
-            frames[i] = frame
-        i += 1
-    cap.release()
-    (bx, by, bw, bh), (sx, sy, sw, sh) = boxes
-    rows = []
-    for p, c in pairs[:20]:
-        if not {p, c - 1, c} <= frames.keys():
-            continue
-        tiles = [frames[p][by:by + bh, bx:bx + bw], frames[c - 1][sy:sy + sh, sx:sx + sw],
-                 frames[c][sy:sy + sh, sx:sx + sw]]
-        tiles = [cv2.resize(t, (int(t.shape[1] * 160 / t.shape[0]), 160)) for t in tiles]
-        rows.append(np.concatenate([np.pad(t, ((4, 4), (4, 4), (0, 0))) for t in tiles], axis=1))
-    if rows:
-        width = max(r.shape[1] for r in rows)
-        cv2.imwrite(str(out), np.concatenate([np.pad(r, ((0, 0), (0, width - r.shape[1]), (0, 0))) for r in rows]))
+    i = 0
+    try:
+        while wanted:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            for row, col in wanted.pop(i, ()):
+                x, y, w, h = boxes[0 if col == 0 else 1]
+                crop = frame[y:y + h, x:x + w]
+                h, w = crop.shape[:2]
+                scale = min(tile_w / w, tile_h / h)
+                dw, dh = max(1, round(w * scale)), max(1, round(h * scale))
+                dx, dy = col * col_w + (col_w - dw) // 2, (row_h - dh) // 2
+                canvas[row, dy:dy + dh, dx:dx + dw] = cv2.resize(crop, (dw, dh))
+                del crop  # release its full camera frame before scanning for the next press
+                filled[row] += 1
+            i += 1
+    finally:
+        cap.release()
+    rows = canvas[filled == 3]
+    if len(rows) and cv2.imwrite(str(out), rows.reshape(-1, 3 * col_w, 3)):
+        return len(rows)
+    return 0
 
 
 def main(argv=None) -> int:
@@ -183,7 +202,7 @@ def main(argv=None) -> int:
     ap.add_argument("--screen", help="press: the box on screen where the reaction shows")
     ap.add_argument("--a", help="side: the PS5's own output (the earlier screen)")
     ap.add_argument("--b", help="side: SmoovPlay (the later screen)")
-    ap.add_argument("--no-sheet", action="store_true", help="press: don't save the picture of each press")
+    ap.add_argument("--no-sheet", action="store_true", help="press: skip the contact sheet of the first 20 matches")
     a = ap.parse_args(argv)
 
     if a.mode == "press":
@@ -192,7 +211,7 @@ def main(argv=None) -> int:
     else:
         boxes = [parse_box(a.a) or pick_box(a.video, "the PS5's own picture"),
                  parse_box(a.b) or pick_box(a.video, "SmoovPlay's picture")]
-    crops, file_fps = read_boxes(a.video, boxes)
+    crops, file_fps = read_boxes(a.video, boxes, changes_only=a.mode == "press")
     fps = a.fps or file_fps
     if not fps:
         sys.exit("the video doesn't say its frame rate: add --fps")
@@ -203,7 +222,7 @@ def main(argv=None) -> int:
     print(f"{len(crops[0])} frames at {fps:.0f} fps ({ms:.1f} ms each)")
 
     if a.mode == "press":
-        presses, changes = presses_of(onsets(change(crops[0])), fps), onsets(change(crops[1]))
+        presses, changes = presses_of(onsets(crops[0]), fps), onsets(crops[1])
         pairs = pair(presses, changes, fps)
         print(f"presses found: {len(presses)}, screen changes: {len(changes)}, matched: {len(pairs)}")
         if not pairs:
@@ -213,12 +232,15 @@ def main(argv=None) -> int:
         delays = [(c - p) * ms for p, c in pairs]
         for n, ((p, c), d) in enumerate(zip(pairs, delays), 1):
             print(f"  press {n:2d}: frame {p} -> {c}: {d:5.1f} ms")
-        print(f"Button to screen: median {np.median(delays):.0f} ms (range {min(delays):.0f}-{max(delays):.0f}, "
-              f"{len(delays)} presses; each reading is +/- {ms:.0f} ms)")
+        median, p95 = np.percentile(delays, [50, 95])
+        print(f"Button to screen: median {median:.0f} ms, p95 {p95:.0f} ms "
+              f"(range {min(delays):.0f}-{max(delays):.0f} ms, {len(delays)} matched presses, "
+              f"each reading is +/- {ms:.0f} ms)")
         if not a.no_sheet:
             out = Path(a.video).with_suffix(".presses.png")
-            sheet(a.video, boxes, pairs, out)
-            print(f"Picture of each press (button, screen before, screen as it changes): {out}")
+            shown = sheet(a.video, boxes, pairs, out)
+            if shown:
+                print(f"First {shown} matched presses (button, screen before, screen as it changes): {out}")
     else:
         frames, match = lag(crops[0], crops[1], fps)
         print(f"SmoovPlay's picture is {frames * ms:.0f} ms behind the PS5's own ({frames:+.1f} frames; how well "

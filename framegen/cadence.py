@@ -14,7 +14,8 @@ one 60 Hz tick (~16.7 ms) plus processing time. At 90 and 120 Hz, two or three f
 The scheduler also has to handle the cadence breaking:
   * game hitch (A A A B B): the extra duplicate is just shown again.
   * real 60 fps content (menus, some cutscenes: A B C D): two new frames in a row, so
-    we pass frames through one tick late instead of interpolating.
+    we present any pending original first. The Xbox window can pass native frames
+    straight through from startup or after a repeat beat has cleared the pending original.
   * scene cut: interpolating across a cut produces a ghosted blend, so hold instead.
 """
 
@@ -262,15 +263,29 @@ class CutDetector:
 class CadenceScheduler:
     """Pure state machine: (is_new, is_cut) per tick -> Action."""
 
-    def __init__(self) -> None:
+    def __init__(self, live_native_60: bool = False) -> None:
+        self.live_native_60 = live_native_60
+        self.live = live_native_60  # start without a pending frame
+        self.new_run = 0
+        self.moving_repeat = False
         self.started = False
         self.pending = False  # a new frame has been received but not yet displayed as itself
 
-    def step(self, is_new: bool, is_cut: bool = False) -> Action:
+    def step(self, is_new: bool, is_cut: bool = False, moving_repeat: bool = False) -> Action:
         if not is_new:
+            # This beat displays the pending original. After a sustained run of unique frames
+            # (100 ms), continue from here in real time. No queued original needs to be skipped.
+            # The adaptive detector can call the first moving menu pictures repeats. Both
+            # were already shown as CURRENT. Starting a blend from the last classified new
+            # frame can step backwards. Two consecutive such captures also drain the queue.
+            self.live = self.live_native_60 and (self.new_run >= 6 or moving_repeat and self.moving_repeat)
+            self.moving_repeat = moving_repeat
+            self.new_run = 0
             self.pending = False
-            return Action.CURRENT  # duplicate of the latest real frame
-        if not self.started:
+            return Action.CURRENT
+        self.new_run += 1
+        self.moving_repeat = False
+        if not self.started or self.live:
             self.started = True
             return Action.CURRENT
         if self.pending:

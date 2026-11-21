@@ -276,6 +276,11 @@ window**: SmoovPlay captures the window of the app you stream with (the Xbox app
 Moonlight or a cloud game in a browser) and shows the smooth picture over it. A player's AVerMedia Live Gamer 4K
 works; the Xbox app and other cards are waiting on reports, so please [send feedback](#help-test-it).
 
+**Window processing** (Settings, Picture) defaults to 1080p. Choose **Captured pixels** to keep the detail the app
+draws at its visible window size. Size the app before pressing Play. A 2560×1440 window then uses 1440p processing
+and needs no final upscale on a matching output. RIFE processes more pixels, and TensorRT may need to build an
+engine on first use. The app controls the stream resolution and bitrate.
+
 A capture card is read at 1080p by default. **Capture card resolution** (Settings, Picture) can ask for 1440p or 4K,
 which is sharper on a screen that big, but every new frame is drawn at that size: 1440p is about twice the work of
 1080p (60 fps on most cards), 4K about four times. Both can run quite sluggish.

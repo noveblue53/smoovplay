@@ -266,6 +266,9 @@ def main() -> int:
     ap.add_argument("--window", metavar="APP",
                     help="--source window: the app's window, as a preset (ps-remote-play, xbox, moonlight), exe:NAME, "
                          "hwnd:N or part of its title (framegen/window.py, Experimental)")
+    ap.add_argument("--window-processing", choices=BY_KEY["window_processing"].choices,
+                    help="--source window: process at 1920x1080 or at the native size of the initial visible region. "
+                         "Default: the saved Window processing setting (1080p)")
     ap.add_argument("--window-keys", metavar="KEYS", default=None,
                     help="--source window: SmoovPlay's shortcuts while the app has the keys, as "
                          '"menu=Ctrl+Alt+K;quit=Ctrl+Alt+End" (actions: menu, quit, fullscreen, stats, smooth; the '
@@ -294,6 +297,8 @@ def main() -> int:
     ap.add_argument("--chiaki-decoder", default="cuda", choices=["cuda", "sw", "d3d11va"],
                     help="how to decode the Remote Play stream (default cuda: NVDEC, frames stay on the GPU, ~1.5 ms "
                          "a frame; sw takes ~10 ms a frame on gameplay)")
+    ap.add_argument("--window-trace", metavar="CSV", help="App window with --display: log final output per beat, "
+                    "from capture to OpenGL swap return (RIFE or generation off)")
     ap.add_argument("--chiaki-log", metavar="CSV", help="write one row per tick: stream facts and pipeline decisions")
     ap.add_argument("--minimize-chiaki", action=argparse.BooleanOptionalAction, default=None,
                     help="minimise chiaki-ng's window while ours is up (it keeps streaming but stops drawing video "
@@ -386,7 +391,12 @@ def main() -> int:
             a.chiaki_decoder = "d3d11va"
 
     kind = a.source or ("chiaki" if a.chiaki else "capture" if a.capture is not None else "file" if a.video else None)
+    if a.window_trace and (kind != "window" or not a.display or a.display_cv):
+        ap.error("--window-trace needs --source window --display with the OpenGL overlay")
     picked = kind  # as asked for: an app's compressed frames on the tap become "chiaki" below, without chiaki-ng
+    settings = Settings() if a.settings.lower() == "none" else Settings.load(Path(a.settings))
+    if a.window_processing:
+        settings.override("window_processing", a.window_processing)
     # Test mode ("Simulate a 30 fps game") works with any 60 Hz source; a video file simulates a PS5 by itself
     # unless --raw plays it as-is.
     test = TestMode(a.test_mode) if kind in ("chiaki", "capture", "tap") or (kind == "file" and a.raw) else None
@@ -411,10 +421,9 @@ def main() -> int:
             ap.error("--source capture needs --capture N (a device) or --capture FILE")
         if a.capture_size:
             cw, ch = map(int, a.capture_size.split("x"))
-        else:  # Capture card resolution (the settings are loaded again below, with the command line's overrides)
+        else:
             from framegen.settings import CAPTURE_SIZES
-            saved = Settings() if a.settings.lower() == "none" else Settings.load(Path(a.settings))
-            cw, ch = CAPTURE_SIZES[saved.capture_size]
+            cw, ch = CAPTURE_SIZES[settings.capture_size]
         print(f"[capture] asking the card for {cw}x{ch}" + ("" if (cw, ch) == (1920, 1080) else
               " (Capture card resolution: every new frame is drawn at this size, so it costs more than 1080p)"))
         src = open_capture(a, cw, ch, test)
@@ -429,7 +438,7 @@ def main() -> int:
         from framegen.sources import Clock60
         from framegen.window import open_window
         try:
-            src = Clock60(open_window(a.window))  # the app draws when it likes: put it on a 60 Hz beat
+            src = Clock60(open_window(a.window, settings.window_processing))
         except RuntimeError as e:
             print(f"[window] {e}", file=sys.stderr)
             return 1
@@ -440,7 +449,6 @@ def main() -> int:
         ap.error("give a video file, --capture N or --chiaki")
     print(f"[run] source: {src.info.name}")
 
-    settings = Settings() if a.settings.lower() == "none" else Settings.load(Path(a.settings))
     for key, value in (("hz", a.hz), ("scaler", a.scaler), ("vsr_quality", a.vsr_quality),
                        ("fsr_sharpness", a.fsr_sharpness), ("engine", "trt" if a.trt else a.engine),
                        ("interp", False if a.off else None), ("vsync", a.vsync), ("fullscreen", a.fullscreen),
@@ -776,6 +784,14 @@ def main() -> int:
     if sink.sinks:
         threading.Thread(target=watchdog, name="watchdog", daemon=True).start()
 
+    trace_file = None
+    trace = None
+    if a.window_trace:
+        from framegen.window_trace import WindowTrace
+        trace_file = open(a.window_trace, "w", newline="", encoding="utf-8")
+        trace = WindowTrace(trace_file)
+        src.source.trace_captures = True
+
     ticks = iter(src)  # one stream for every session, so a restart doesn't reconnect or reopen anything
     if sink.sinks:  # playing on screen: keep frames on time when other programs are busy
         from framegen.winutil import boost_gpu, boost_thread, keep_screen_on
@@ -792,11 +808,17 @@ def main() -> int:
             label = label_of(cfg)
             pipe = Pipeline(interp, make_detector(src.info, a.dup_threshold))
             live[:] = [pipe, cfg]
+            if trace is not None:
+                trace.last_new = None
+                window.frame_trace = None if getattr(interp, "private", False) else trace
+                if window.frame_trace is None:
+                    print("[window] frame trace paused for the private engine")
             stats = pipe.run(ticks, sink if sink.sinks else None, score=a.score, label=label,
                              on_tick=getattr(src, "log_tick", None), settings=settings,
                              gt=test.gt if test is not None else getattr(src, "gt", None),
                              remote=src if kind in ("chiaki", "capture") and hasattr(src, "can_press") else None,
-                             replay=replay)
+                             replay=replay, trace=window.frame_trace if trace is not None else None,
+                             live_native_60=kind == "window" and src.xbox_window)
             live[:] = [None, None]  # first, so a report written meanwhile never counts this session twice
             if a.results:
                 done.append((cfg, stats))
@@ -839,12 +861,17 @@ def main() -> int:
             show(hidden, SW_RESTORE)
         if replay is not None:
             replay.close(wait_saves=30)  # a clip being saved is finished first; before & after carries on alone
+        if trace_file is not None:
+            trace_file.close()
         sink.close()
         src.close()
         stop_results.set()
         if results_thread.is_alive():
             results_thread.join(timeout=5)  # so the last write below isn't racing one already under way
     print(stats.summary())
+    if kind == "window" and src.xbox_window:
+        print(f"[window] 60 Hz clock: {src.overtaken} captures overtaken before selection; "
+              f"{src.desktop_copies} exact CPU desktop recaptures discarded")
     if a.results and results_now():
         print(f"[results] test results -> {a.results}")
     write_stream_check(src, a.results)

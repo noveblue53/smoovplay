@@ -607,6 +607,7 @@ class GLWindowSink:
         details = {"fsr": f" (sharpness {sharpness:g})", "vsr": f" (quality {vsr_quality})", "bilinear": ""}
         print(f"[display] upscaling with {self._name(self.mode)}{details[self.mode]}; u cycles "
               + " / ".join(self._name(m) for m in self.modes) + "; m opens the settings menu")
+        self.frame_trace = None
         self.timer = GpuTimer(GL)  # GPU time of the scale/draw step, reported on close
 
         # Looks: which one is on (the settings, or the launcher's Looks page while it edits one) and its drawing.
@@ -1284,6 +1285,8 @@ class GLWindowSink:
         label = self._name(mode) if upscale else "no upscale"
         self._frame_no += 1
         plan = self.look_gl.plan(self.looks.current(), self.looks.rev) if self.look_gl is not None else None
+        if self.frame_trace is not None:
+            draw_start = time.perf_counter()
         q = self.timer.begin()
         if plan is not None:  # the upscaler draws into the look's input, and the look onto the screen
             if upscale and mode == "fsr":
@@ -1317,7 +1320,11 @@ class GLWindowSink:
             first, nl, rest = text.partition("\n")  # the upscaler goes on the first line; a second is the test line
             self._draw_stats(f"{first}  {label}{nl}{rest}", ux, uy, uw, uh)
         self._draw_ui(ux, uy, uw, uh)
+        if self.frame_trace is not None:
+            swap_start = time.perf_counter()
         self._present()
+        if self.frame_trace is not None:
+            self.frame_trace.draw = (label, fw, fh, draw_start, swap_start, time.perf_counter())
         self.settle()
         self._events()
         if self.remote is not None:
