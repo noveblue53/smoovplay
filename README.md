@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/smoovplay/smoovplay/releases/latest"><b>⬇ Download for Windows</b></a>
+  <a href="https://github.com/smoovplay/smoovplay/releases/latest"><b>Download stock SmoovPlay for Windows</b></a>
   &nbsp;·&nbsp; <a href="https://smoovplay.github.io/"><b>🌐 Website</b></a>
   &nbsp;·&nbsp; <a href="https://smoovplay.github.io/compare/"><b>▶ Watch it at full frame rate</b></a>
   &nbsp;·&nbsp; <a href="#what-it-does">What it does</a>
@@ -19,6 +19,12 @@
   &nbsp;·&nbsp; <a href="#how-it-works">How it works</a>
   &nbsp;·&nbsp; <a href="#faq">FAQ</a>
 </p>
+
+## Install the Xbox branch on Windows
+
+Sign in to the fork as its owner and open the **SmoovPlay Xbox 0.3.11-xbox.1** draft. Download **SmoovPlay-Xbox-Setup.exe** under **Assets** and run the setup wizard. It installs its own Python and GPU packages and adds **SmoovPlay Xbox** to Start. Allow about 12 GB of free space during setup. [Fork releases](https://github.com/noveblue53/smoovplay/releases)
+
+Start Remote Play in the Windows Xbox app and leave the stream visible. Open **SmoovPlay Xbox**, confirm **App window** shows the Xbox app, and press **Play**. The first launch uses the 60 fps RTX 4070 Ti profile with RIFE 4.22 Lite and FSR 1. The Xbox app handles the controller and audio.
 
 <p align="center">
   <a href="https://github.com/smoovplay/smoovplay/releases"><img alt="Status: early release" src="https://img.shields.io/badge/status-early%20release-FFB02E?style=flat-square"></a>

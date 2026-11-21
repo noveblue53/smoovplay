@@ -35,6 +35,8 @@ import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
+from .user_paths import data_dir
+
 PREFIX = "SPL1-"
 MAX_NODES = 16
 MAX_LUTS = 4  # LUT nodes a look can use at once (texture units)
@@ -44,7 +46,7 @@ W709 = (0.2126, 0.7152, 0.0722)  # luma weights
 
 def looks_dir() -> Path:
     env = os.environ.get("SMOOVPLAY_LOOKS_DIR")
-    return Path(env) if env else Path(os.environ.get("APPDATA", Path.home())) / "framegen" / "looks"
+    return Path(env) if env else data_dir() / "looks"
 
 
 # ---------------------------------------------------------------------------------------------- the node types

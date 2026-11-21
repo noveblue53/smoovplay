@@ -39,10 +39,12 @@ import av
 import numpy as np
 from av.video.frame import PictureType
 
+from .user_paths import data_dir
+
 ROOT = Path(__file__).resolve().parents[1]
 # A before & after video being made keeps a file here named after its process id, holding the video's path, so the
 # launcher knows. It carries on after the video window and the launcher close; updating SmoovPlay would stop it.
-SAVING_DIR = Path(os.environ.get("APPDATA", Path.home())) / "framegen" / "saving"
+SAVING_DIR = data_dir() / "saving"
 TB = 90000  # MPEG-TS clock: every timestamp here is in 1/90000 s
 OFFSET = 10 * TB  # timestamps start 10 s in, so none is ever negative
 LENGTHS = (0, 30, 60, 120, 300)  # settings.replay's choices, in seconds (0: off)

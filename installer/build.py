@@ -31,10 +31,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-VERSION = "0.3.11"  # a pre-release sorts before its release: 0.1.0-beta.2 and 0.1.0 both show as updates
+VERSION = "0.3.11-xbox.1"  # a pre-release sorts before its release: 0.1.0-beta.2 and 0.1.0 both show as updates
 # "owner/name" of the GitHub repo whose releases the launcher checks for updates; empty turns the check off
-RELEASES_REPO = "smoovplay/smoovplay"
-SIGNING_KEY = Path(os.environ.get("SMOOVPLAY_SIGNING_KEY") or Path.home() / ".smoovplay" / "update-signing-key.xml")
+RELEASES_REPO = "noveblue53/smoovplay"
+SIGNING_KEY = Path(os.environ.get("SMOOVPLAY_SIGNING_KEY") or Path.home() / ".smoovplay-xbox" / "update-signing-key.xml")
 PYTHON_VERSION = "3.12.10"
 PYTHON_URL = f"https://www.python.org/ftp/python/{PYTHON_VERSION}/python-{PYTHON_VERSION}-embed-amd64.zip"
 # python.org lists only an MD5 for this file (fe8ef205f2e9c3ba44d0cf9954e1abd3, which matched); this is its SHA-256.
@@ -196,6 +196,8 @@ def stage_payload(stage: Path, launcher: Path, chiaki_build: Path, chiaki_src: P
     app.mkdir(parents=True)
     shutil.copy2(ROOT / "run.py", app)
     shutil.copytree(ROOT / "framegen", app / "framegen", ignore=ignore_pycache)
+    (app / "profiles").mkdir()
+    shutil.copy2(ROOT / "profiles" / "xbox-4070ti.json", app / "profiles")
     (app / "models").mkdir()
     model = ROOT / "models" / MODEL
     if not model.exists():

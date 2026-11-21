@@ -47,7 +47,7 @@ namespace SmoovPlay
         Paths paths;
         Installer installer;
         Session session;
-        SourceDef source = Sources.RemotePlay;  // where the video comes from (the Play page's picker)
+        SourceDef source = Paths.XboxBuild ? new SourceDef { Kind = "window", Name = "App window", Experimental = true, TestMode = false } : Sources.RemotePlay;  // where the video comes from (the Play page's picker)
         bool allowClose, finishSetup;
         string page;
         readonly HashSet<string> prefs;
@@ -219,7 +219,7 @@ namespace SmoovPlay
 
         void Wire()
         {
-            Window.Title = setupMode ? "SmoovPlay Setup" : "SmoovPlay";
+            Window.Title = Paths.ProductName + (setupMode ? " Setup" : "");
             try
             {
                 using (var ico = System.Drawing.Icon.ExtractAssociatedIcon(Assembly.GetExecutingAssembly().Location))
@@ -270,7 +270,7 @@ namespace SmoovPlay
             Click("BtnShortPath", () =>
             {
                 string root2 = SafeRoot(dir.Text) ?? Path.GetPathRoot(Paths.DefaultInstall);
-                dir.Text = Path.Combine(root2, "SmoovPlay");
+                dir.Text = Path.Combine(root2, Paths.ProductName);
             });
             Click("BtnLongPaths", () => Busy("BtnLongPaths", SystemCheck.EnableLongPaths, err =>
             {
@@ -505,7 +505,7 @@ namespace SmoovPlay
             BuildStepper();
             SetStep(2);
             E<TextBox>("DirBox").Text = paths.Install;
-            E<CheckBox>("ToggleDesktop").IsChecked = File.Exists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "SmoovPlay.lnk"));
+            E<CheckBox>("ToggleDesktop").IsChecked = File.Exists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), Paths.ShortcutName));
             T("InstallOverline").Text = "UPDATING TO " + V(BuildInfo.Version);
             T("InstallTitle").Text = "Updating SmoovPlay";
             T("InstallSub").Text = "A minute or two. SmoovPlay opens again when it's done, with your settings, looks and clips.";
@@ -592,7 +592,7 @@ namespace SmoovPlay
             LoadSources();
             LoadVfgStatus();  // for the chips and the Settings page
             string want = opts.Page;
-            if (want == null) want = prefs.Contains("guide-seen") ? "play" : "guide";
+            if (want == null) want = Paths.XboxBuild || prefs.Contains("guide-seen") ? "play" : "guide";
             if (!prefs.Contains("guide-seen")) { prefs.Add("guide-seen"); Prefs.Save(prefs); }
             Nav(want == "guide" ? "PageGuide" : want == "check" ? "PageCheck" : want == "settings" ? "PageSettings" : want == "looks" ? "PageLooks" : want == "help" ? "PageHelp" : "PagePlay");
         }
@@ -866,11 +866,11 @@ namespace SmoovPlay
         {
             sub = false;
             string dir = Path.GetFullPath(raw.Trim()).TrimEnd('\\');
-            if (dir.Length <= 3) { sub = true; return Path.Combine(dir + "\\", "SmoovPlay"); }  // a drive root
+            if (dir.Length <= 3) { sub = true; return Path.Combine(dir + "\\", Paths.ProductName); }  // a drive root
             if (Directory.Exists(dir) && Directory.EnumerateFileSystemEntries(dir).Any() && !Paths.ForInstall(dir).IsInstall)
             {
                 sub = true;
-                return Path.Combine(dir, "SmoovPlay");
+                return Path.Combine(dir, Paths.ProductName);
             }
             return dir;
         }
@@ -888,7 +888,7 @@ namespace SmoovPlay
                 try { dir = ResolveDir(raw, out sub); problem = SystemCheck.FolderProblem(dir, out tooLong); }
                 catch (Exception e) { problem = e.Message; }
             }
-            if (problem == null && dir != null) problem = SystemCheck.WriteProblem(dir);
+            if (problem == null && dir != null) problem = Paths.InstallConflict(dir) ?? SystemCheck.WriteProblem(dir);
             string root = SafeRoot(raw);
             double free = 0, total = 0;
             try
@@ -957,7 +957,7 @@ namespace SmoovPlay
             if (picked == null) return;
             string name = Path.GetFileName(picked.TrimEnd('\\'));
             bool isInstall = Paths.ForInstall(picked).IsInstall;
-            box.Text = isInstall || name.Equals("SmoovPlay", StringComparison.OrdinalIgnoreCase) ? picked : Path.Combine(picked, "SmoovPlay");
+            box.Text = isInstall || name.Equals(Paths.ProductName, StringComparison.OrdinalIgnoreCase) ? picked : Path.Combine(picked, Paths.ProductName);
             ValidateDir();
         }
 
@@ -1219,7 +1219,7 @@ namespace SmoovPlay
             {
                 SetStep(4);
                 T("DoneSub").Text = "Updated to " + V(BuildInfo.Version) + ". Opening SmoovPlay...";
-                T("BtnOpenText").Text = "Open SmoovPlay";
+                T("BtnOpenText").Text = "Open " + Paths.ProductName;
                 var reopen = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
                 reopen.Tick += (s, e) => { reopen.Stop(); OpenAfterInstall(); };
                 reopen.Start();
@@ -1227,8 +1227,10 @@ namespace SmoovPlay
             else if (setupMode)
             {
                 SetStep(4);
-                T("DoneSub").Text = "It's in your Start menu too. Next, SmoovPlay walks you through connecting your PS5: about five minutes, once.";
-                T("BtnOpenText").Text = "Open SmoovPlay";
+                T("DoneSub").Text = Paths.XboxBuild
+                    ? "Start Remote Play in the Xbox app, then open SmoovPlay Xbox and press Play."
+                    : "It's in your Start menu too. Next, SmoovPlay walks you through connecting your PS5: about five minutes, once.";
+                T("BtnOpenText").Text = "Open " + Paths.ProductName;
             }
             else
             {
@@ -1254,7 +1256,7 @@ namespace SmoovPlay
             T("CheckOverline").Text = "PC CHECK";
             T("CheckTitle").Text = "Your PC";
             T("CheckSub").Text = "What SmoovPlay found. Anything that needs attention can be fixed from here.";
-            Nav(prefs.Contains("guide-done") ? "PagePlay" : "PageGuide");
+            Nav(Paths.XboxBuild || prefs.Contains("guide-done") ? "PagePlay" : "PageGuide");
         }
 
         void Celebrate()

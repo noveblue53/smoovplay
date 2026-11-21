@@ -16,8 +16,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import fill, looks
+from .user_paths import data_dir
 
-DEFAULT_PATH = Path(os.environ.get("APPDATA", Path.home())) / "framegen" / "settings.json"
+DEFAULT_PATH = Path(os.environ.get("SMOOVPLAY_SETTINGS") or data_dir() / "settings.json")
 
 
 @dataclass(frozen=True)

@@ -34,6 +34,7 @@ namespace SmoovPlay
         {
             get
             {
+                if (Paths.XboxBuild) return null;  // personal test build, updated manually
                 string r = Environment.GetEnvironmentVariable("SMOOVPLAY_RELEASES_REPO") ?? BuildInfo.ReleasesRepo;
                 return Regex.IsMatch(r ?? "", @"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$") ? r : null;
             }
@@ -158,7 +159,7 @@ namespace SmoovPlay
     /// </summary>
     static class Updater
     {
-        public static string Folder { get { return Path.Combine(Path.GetTempPath(), "SmoovPlay-update"); } }
+        public static string Folder { get { return Path.Combine(Path.GetTempPath(), Paths.ProductName + "-update"); } }
 
         /// <summary>Why this copy can't update itself (then the release page is offered instead); null if it can.</summary>
         public static string Unavailable(Paths p)

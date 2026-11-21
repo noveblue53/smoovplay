@@ -70,7 +70,7 @@ namespace SmoovPlay
             return app.Run(ui.Window);
         }
 
-        public static string CrashLog { get { return Path.Combine(Path.GetTempPath(), "SmoovPlay-launcher-errors.log"); } }
+        public static string CrashLog { get { return Path.Combine(Path.GetTempPath(), Paths.ProductName + "-launcher-errors.log"); } }
 
         /// <summary>A launcher bug: keep the details in a log (diagnostics include it) and say so.</summary>
         static void Crash(Exception e)
@@ -102,7 +102,9 @@ namespace SmoovPlay
         static int UnattendedInstall(Options opts)
         {
             WaitFor(opts.Wait, 30);
-            Paths paths = opts.Dir != null ? Paths.ForInstall(opts.Dir) : Paths.Detect();
+            Paths paths = opts.Dir != null ? Paths.ForInstall(opts.Dir) :
+                          Paths.XboxBuild && Payload.Present ? Paths.ForInstall(Paths.ExistingInstall ?? Paths.DefaultInstall) : Paths.Detect();
+            if (Paths.InstallConflict(paths.Install) != null) return 1;
             Directory.CreateDirectory(paths.Install);
             using (var log = new StreamWriter(Path.Combine(paths.Install, "install.log"), false, Encoding.UTF8) { AutoFlush = true })
             {
@@ -160,6 +162,19 @@ namespace SmoovPlay
         public string Vfx;  // NVIDIA VFG, if the user sets it up (Vfg.cs); every Python process gets it as FRAMEGEN_VFX_PATH
         public bool Dev;
 
+        public static readonly bool XboxBuild = string.Equals(BuildInfo.ReleasesRepo, "noveblue53/smoovplay", StringComparison.OrdinalIgnoreCase);
+        public static string ProductName { get { return XboxBuild ? "SmoovPlay Xbox" : "SmoovPlay"; } }
+        public static string ShortcutName { get { return ProductName + ".lnk"; } }
+        public static string StartShortcut
+        {
+            get
+            {
+                string programs = Environment.GetFolderPath(Environment.SpecialFolder.Programs);
+                return XboxBuild ? Path.Combine(programs, ProductName, ShortcutName) : Path.Combine(programs, ShortcutName);
+            }
+        }
+        public const string XboxProfile = @"profiles\xbox-4070ti.json";
+
         public static Paths ForInstall(string dir)
         {
             var p = new Paths { Install = dir };
@@ -181,7 +196,7 @@ namespace SmoovPlay
             var p = new Paths { Dev = true, Python = py };
             p.App = Environment.GetEnvironmentVariable("SMOOVPLAY_APP") ?? ExeDir;
             p.Install = p.App;
-            p.Runtime = Path.Combine(Path.GetTempPath(), "SmoovPlay-dev");
+            p.Runtime = Path.Combine(Path.GetTempPath(), ProductName + "-dev");
             p.Chiaki = Environment.GetEnvironmentVariable("SMOOVPLAY_CHIAKI") ?? "";
             p.ChiakiArgs = Environment.GetEnvironmentVariable("SMOOVPLAY_CHIAKI_ARGS") ?? "";
             p.RunArgs = Environment.GetEnvironmentVariable("SMOOVPLAY_RUN_ARGS") ?? "";
@@ -194,8 +209,34 @@ namespace SmoovPlay
         public static string ExeDir { get { return Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location); } }
         public static string DefaultInstall
         {
-            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "SmoovPlay"); }
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", ProductName); }
         }
+        /// <summary>Keep an explicitly chosen fork destination out of any other SmoovPlay installation.</summary>
+        public static string InstallConflict(string dir)
+        {
+            if (!XboxBuild) return null;
+            const string message = "Choose a separate folder for SmoovPlay Xbox, outside the existing SmoovPlay installation.";
+            var destination = new DirectoryInfo(dir);
+            for (var folder = destination; folder != null; folder = folder.Parent)
+            {
+                if (File.Exists(Path.Combine(folder.FullName, "app", "run.py")) &&
+                    (folder != destination || !File.Exists(Path.Combine(folder.FullName, "app", XboxProfile)))) return message;
+            }
+            // Also protect a stock install inside the selected folder (e.g. when --dir names its parent).
+            using (var k = Registry.CurrentUser.OpenSubKey(Uninstaller.StockKey))
+            {
+                string stock = k == null ? null : k.GetValue("InstallLocation") as string;
+                if (!string.IsNullOrEmpty(stock))
+                {
+                    string target = destination.FullName.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                    stock = Path.GetFullPath(stock).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                    if (target.StartsWith(stock, StringComparison.OrdinalIgnoreCase) ||
+                        stock.StartsWith(target, StringComparison.OrdinalIgnoreCase)) return message;
+                }
+            }
+            return null;
+        }
+
         /// <summary>Where an earlier install is, from its Apps &amp; features entry (null if none).</summary>
         public static string ExistingInstall
         {
@@ -214,7 +255,7 @@ namespace SmoovPlay
         }
         public static string SettingsDir
         {
-            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "framegen"); }
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), XboxBuild ? ProductName : "framegen"); }
         }
         /// <summary>The pipeline's settings (SMOOVPLAY_SETTINGS overrides it, for tests and recordings).</summary>
         public static string SettingsFile
@@ -222,7 +263,8 @@ namespace SmoovPlay
             get { return Environment.GetEnvironmentVariable("SMOOVPLAY_SETTINGS") ?? Path.Combine(SettingsDir, "settings.json"); }
         }
         public bool RuntimeReady { get { return Dev ? File.Exists(Python) : File.Exists(Ready) && File.Exists(Python); } }
-        public bool IsInstall { get { return File.Exists(Path.Combine(App, "run.py")); } }
+        public bool IsInstall { get { return File.Exists(Path.Combine(App, "run.py")) &&
+                                            (!XboxBuild || File.Exists(Path.Combine(App, XboxProfile))); } }
     }
 
     static class Payload
@@ -275,6 +317,8 @@ namespace SmoovPlay
 
         public void Run()
         {
+            string conflict = Paths.InstallConflict(p.Install);
+            if (conflict != null) throw new InvalidOperationException(conflict);
             Log($"SmoovPlay {BuildInfo.Version} setup, {DateTime.Now:yyyy-MM-dd HH:mm:ss}, into {p.Install}");
             if (p.Install.Any(c => c > 127))  // (diagnostics hide the user's name, which can be where they are)
                 Log("Note: the install folder's path has letters outside English A-Z. If a step fails, a folder like C:\\SmoovPlay is worth a try.");
@@ -290,6 +334,12 @@ namespace SmoovPlay
             double at = 0;
             StepStarted(0);
             if (extract) ExtractPayload(at, WExtract);
+            if (Paths.XboxBuild && !File.Exists(Paths.SettingsFile))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(Paths.SettingsFile)));
+                try { File.Copy(Path.Combine(p.App, Paths.XboxProfile), Paths.SettingsFile, false); }
+                catch (IOException) { if (!File.Exists(Paths.SettingsFile)) throw; }  // another setup seeded it
+            }
             at += WExtract;
             StepStarted(1);
             InstallPython(at, WPython); at += WPython;
@@ -436,7 +486,7 @@ namespace SmoovPlay
             Progress(at, "Optimising for your graphics card");
             var stepRe = new Regex(@"step (\d+) of (\d+)");
             string lastError = null;
-            int rc = RunPython("-m framegen.prepare", p.App, line =>
+            int rc = RunPython(Paths.XboxBuild ? "-m framegen.prepare --no-detect" : "-m framegen.prepare", p.App, line =>
             {
                 Log(line);
                 if (line.Contains("DLL load failed") || line.Contains("ImportError")) lastError = line;
@@ -459,14 +509,15 @@ namespace SmoovPlay
         {
             Step("Adding shortcuts");
             string exe = Path.Combine(p.Install, "SmoovPlay.exe");
-            Shortcuts.Create(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "SmoovPlay.lnk"), exe, p.Install);
+            Directory.CreateDirectory(Path.GetDirectoryName(Paths.StartShortcut));
+            Shortcuts.Create(Paths.StartShortcut, exe, p.Install);
             if (desktopShortcut)
-                Shortcuts.Create(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "SmoovPlay.lnk"), exe, p.Install);
+                Shortcuts.Create(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), Paths.ShortcutName), exe, p.Install);
             using (var k = Registry.CurrentUser.CreateSubKey(Uninstaller.Key))
             {
-                k.SetValue("DisplayName", "SmoovPlay");
+                k.SetValue("DisplayName", Paths.ProductName);
                 k.SetValue("DisplayVersion", BuildInfo.Version);
-                k.SetValue("Publisher", "the SmoovPlay authors");
+                k.SetValue("Publisher", Paths.XboxBuild ? "noveblue53 (SmoovPlay fork)" : "the SmoovPlay authors");
                 k.SetValue("InstallLocation", p.Install);
                 k.SetValue("DisplayIcon", exe);
                 k.SetValue("UninstallString", "\"" + exe + "\" --uninstall");
@@ -557,6 +608,11 @@ namespace SmoovPlay
             psi.EnvironmentVariables["PYTHONUNBUFFERED"] = "1";  // for a dev venv Python, which does read them
             psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
             psi.EnvironmentVariables["PIP_DISABLE_PIP_VERSION_CHECK"] = "1";
+            if (Paths.XboxBuild)
+            {
+                psi.EnvironmentVariables["SMOOVPLAY_DATA_DIR"] = Paths.SettingsDir;
+                psi.EnvironmentVariables["SMOOVPLAY_SETTINGS"] = Paths.SettingsFile;
+            }
             if (!string.IsNullOrEmpty(VfxPath)) psi.EnvironmentVariables["FRAMEGEN_VFX_PATH"] = VfxPath;  // a plain variable: the embeddable Python passes it on
             return psi;
         }
@@ -624,13 +680,14 @@ namespace SmoovPlay
 
     static class Uninstaller
     {
-        public const string Key = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\SmoovPlay";
+        public const string StockKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\SmoovPlay";
+        public static string Key { get { return Paths.XboxBuild ? StockKey + " Xbox" : StockKey; } }
 
         /// <param name="confirmed">The launcher already asked (its Help page).</param>
         public static int Run(bool confirmed)
         {
             string dir = Paths.ExeDir;
-            if (!Paths.ForInstall(dir).IsInstall)
+            if (!Paths.ForInstall(dir).IsInstall || Paths.InstallConflict(dir) != null)
             {
                 System.Windows.MessageBox.Show("This copy of SmoovPlay isn't an installed one, so there's nothing to remove.", "SmoovPlay");
                 return 1;
@@ -639,11 +696,15 @@ namespace SmoovPlay
                                                System.Windows.MessageBoxButton.OKCancel, System.Windows.MessageBoxImage.Question)
                 != System.Windows.MessageBoxResult.OK)
                 return 1;
-            foreach (var lnk in new[] {
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "SmoovPlay.lnk"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "SmoovPlay.lnk") })
-                try { if (File.Exists(lnk)) File.Delete(lnk); } catch (Exception) { }
-            try { Registry.CurrentUser.DeleteSubKeyTree(Key, false); } catch (Exception) { }
+            if (!Paths.XboxBuild || string.Equals(Paths.ExistingInstall, dir, StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (var lnk in new[] { Paths.StartShortcut,
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), Paths.ShortcutName) })
+                    try { if (File.Exists(lnk)) File.Delete(lnk); } catch (Exception) { }
+                if (Paths.XboxBuild)
+                    try { Directory.Delete(Path.GetDirectoryName(Paths.StartShortcut)); } catch (IOException) { }
+                try { Registry.CurrentUser.DeleteSubKeyTree(Key, false); } catch (Exception) { }
+            }
             // Only what setup created is removed, then the folder itself if that leaves it empty. This exe is inside
             // it, so a short-lived cmd does the deleting once we've exited.
             var cmd = new StringBuilder("/c ping 127.0.0.1 -n 3 > nul");
@@ -801,13 +862,14 @@ namespace SmoovPlay
         public static SourceDef Chosen(Paths p, HashSet<string> prefs)
         {
             var offered = Offered(p);
-            return offered.FirstOrDefault(s => prefs.Contains("source:" + s.Kind)) ?? offered.FirstOrDefault(s => s.RemotePlay) ?? RemotePlay;
+            return offered.FirstOrDefault(s => prefs.Contains("source:" + s.Kind))
+                   ?? offered.FirstOrDefault(s => s.Kind == (Paths.XboxBuild ? "window" : "chiaki")) ?? RemotePlay;
         }
 
         public static void Choose(HashSet<string> prefs, string kind)
         {
             prefs.RemoveWhere(f => f.StartsWith("source:"));
-            if (kind != "chiaki") prefs.Add("source:" + kind);  // Remote Play is the default, so it needs no flag
+            if (kind != (Paths.XboxBuild ? "window" : "chiaki")) prefs.Add("source:" + kind);
         }
 
         /// <summary>What run.py needs to play from a source. video, audio: the capture card and its sound as picked on
@@ -818,7 +880,7 @@ namespace SmoovPlay
                 return "--source capture --capture " + Quote(Environment.GetEnvironmentVariable("SMOOVPLAY_CAPTURE") ?? video ?? "0")
                        + (audio != null ? " --capture-audio " + Quote(audio) : "");
             if (kind == "window")  // video: the app's window, as AppWindows.Query gives it
-                return "--source window --window " + Quote(Environment.GetEnvironmentVariable("SMOOVPLAY_WINDOW") ?? video ?? "ps-remote-play");
+                return "--source window --window " + Quote(Environment.GetEnvironmentVariable("SMOOVPLAY_WINDOW") ?? video ?? (Paths.XboxBuild ? "xbox" : "ps-remote-play"));
             if (kind == "tap")  // SMOOVPLAY_TAP: another shared-memory name (docs/frame-tap.md)
                 return "--source tap" + (Environment.GetEnvironmentVariable("SMOOVPLAY_TAP") != null
                                          ? " --tap " + Quote(Environment.GetEnvironmentVariable("SMOOVPLAY_TAP")) : "");
@@ -888,6 +950,7 @@ namespace SmoovPlay
         {
             string hwnd = CaptureDevices.Pref(prefs, "window-hwnd:"), exe = CaptureDevices.Pref(prefs, "window-app:");
             return List.FirstOrDefault(w => w.Hwnd.ToString() == hwnd) ?? List.FirstOrDefault(w => w.Exe == exe)
+                   ?? (Paths.XboxBuild ? List.FirstOrDefault(w => w.Exe == "xboxpcapp.exe" || w.Exe == "xboxpcappce.exe") : null)
                    ?? List.FirstOrDefault(w => w.Known) ?? List.FirstOrDefault();
         }
 
