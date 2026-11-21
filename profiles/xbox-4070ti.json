@@ -1,0 +1,20 @@
+{
+  "hz": 60,
+  "interp": true,
+  "model": "4.22.lite",
+  "motion": "full",
+  "engine": "auto",
+  "game_fps": "auto",
+  "even_out": true,
+  "even_dips": false,
+  "window_processing": "1080p",
+  "scaler": "fsr",
+  "fsr_sharpness": 0.5,
+  "steady_hud": false,
+  "fullscreen": true,
+  "present": "gl",
+  "vsync": false,
+  "look_on": false,
+  "replay": 0,
+  "overlay": false
+}
