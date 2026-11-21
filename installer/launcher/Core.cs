@@ -29,6 +29,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
+using System.IO.MemoryMappedFiles;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -269,11 +270,12 @@ namespace SmoovPlay
 
     static class Payload
     {
+        public static bool Web { get { return Assembly.GetExecutingAssembly().GetManifestResourceNames().Contains("xbox-app.zip"); } }
         public static bool Present
         {
-            get { return Assembly.GetExecutingAssembly().GetManifestResourceNames().Contains("payload.zip"); }
+            get { return Web || Assembly.GetExecutingAssembly().GetManifestResourceNames().Contains("payload.zip"); }
         }
-        public static Stream Open() { return Assembly.GetExecutingAssembly().GetManifestResourceStream("payload.zip"); }
+        public static Stream Open() { return Assembly.GetExecutingAssembly().GetManifestResourceStream(Web ? "xbox-app.zip" : "payload.zip"); }
     }
 
     // ------------------------------------------------------------------------------------------------ install
@@ -360,15 +362,82 @@ namespace SmoovPlay
         void Step(string s) { Log("== " + s); }
         void ThrowIfCancelled() { if (cancelled) throw new OperationCanceledException("Cancelled."); }
 
+        // The web setup reuses only the unmodified model, chiaki-ng and notices from this exact release.
+        // These are the offset, length and SHA-256 of its managed payload.zip resource.
+        const string SharedSetupUrl = "https://github.com/smoovplay/smoovplay/releases/download/v0.3.11/SmoovPlay-Setup.exe";
+        const string SharedSetupSha = "4F9579C985346B483669AD1CDDD1CB45A3D918644D7B5F4644A474FD80D08877";
+        const string SharedZipSha = "882858B56E052951D55547AE7A95CA948A38A332011582EC393A14BFC84C368B";
+        const long SharedZipOffset = 456484, SharedZipLength = 139873770;
+
+        static bool SharedAsset(string name)
+        {
+            return name.StartsWith("chiaki/", StringComparison.Ordinal) || name == "app/models/flownet_v4.22.lite.pkl" ||
+                   name == "LICENSE.txt" || name == "THIRD_PARTY_NOTICES.txt";
+        }
+
         void ExtractPayload(double at, double w)
         {
-            Step("Unpacking SmoovPlay");
-            string root = Path.GetFullPath(p.Install).TrimEnd('\\') + "\\";
-            int files = 0;
-            using (var z = new ZipArchive(Payload.Open(), ZipArchiveMode.Read))
+            if (Payload.Web)
             {
-                long total = Math.Max(1, z.Entries.Sum(e => e.Length)), done = 0;
-                foreach (var e in z.Entries)
+                ExtractSharedAssets(at, w * 0.9);
+                at += w * 0.9;
+                w *= 0.1;
+            }
+            Step("Unpacking SmoovPlay");
+            using (var input = Payload.Open())
+                ExtractZip(input, false, at, w);
+        }
+
+        void ExtractSharedAssets(double at, double w)
+        {
+            const string download = "Downloading the official v0.3.11 model and chiaki-ng bundle (140.5 MB)";
+            string dir = Path.Combine(p.Runtime, "downloads");
+            Directory.CreateDirectory(dir);
+            string file = Path.Combine(dir, "smoovplay-0.3.11-assets.bin");
+            if (!File.Exists(file))
+            {
+                Step(download);
+                Progress(at, download);
+                Download(SharedSetupUrl, file, f => Progress(at + w * 0.65 * f, download));
+            }
+            const string verify = "Verifying the v0.3.11 download and its embedded ZIP";
+            Step(verify);
+            Progress(at + w * 0.65, verify);
+            try
+            {
+                // Hold a read-only handle through extraction. The downloaded executable is treated as data.
+                using (var source = File.OpenRead(file))
+                {
+                    if (Sha256(source) != SharedSetupSha)
+                        throw new InvalidDataException("The official v0.3.11 download failed its SHA-256 check. Press Retry to download it again.");
+                    using (var map = MemoryMappedFile.CreateFromFile(source, null, 0, MemoryMappedFileAccess.Read,
+                                                                    HandleInheritability.None, true))
+                    using (var zip = map.CreateViewStream(SharedZipOffset, SharedZipLength, MemoryMappedFileAccess.Read))
+                    {
+                        if (Sha256(zip) != SharedZipSha)
+                            throw new InvalidDataException("The v0.3.11 payload ZIP failed its SHA-256 check. Press Retry.");
+                        zip.Position = 0;
+                        Step("Unpacking the verified model and chiaki-ng");
+                        ExtractZip(zip, true, at + w * 0.7, w * 0.3);
+                    }
+                }
+            }
+            catch (InvalidDataException)
+            {
+                File.Delete(file);
+                throw;
+            }
+        }
+
+        void ExtractZip(Stream input, bool sharedOnly, double at, double w)
+        {
+            string root = Path.GetFullPath(p.Install).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            int files = 0;
+            using (var z = new ZipArchive(input, ZipArchiveMode.Read, true))
+            {
+                var entries = z.Entries.Where(e => !sharedOnly || SharedAsset(e.FullName)).ToList();
+                long total = Math.Max(1, entries.Sum(e => e.Length)), done = 0;
+                foreach (var e in entries)
                 {
                     ThrowIfCancelled();
                     string dest = Path.GetFullPath(Path.Combine(p.Install, e.FullName));
@@ -383,7 +452,7 @@ namespace SmoovPlay
                     }
                     files++;
                     done += e.Length;
-                    Progress(at + w * done / total, "Unpacking SmoovPlay");
+                    Progress(at + w * done / total, sharedOnly ? "Unpacking the model and chiaki-ng" : "Unpacking SmoovPlay");
                 }
             }
             Log($"Unpacked {files} files");
@@ -576,9 +645,13 @@ namespace SmoovPlay
 
         static string Sha256(string file)
         {
+            using (var stream = File.OpenRead(file)) return Sha256(stream);
+        }
+
+        static string Sha256(Stream stream)
+        {
             using (var h = System.Security.Cryptography.SHA256.Create())
-            using (var f = File.OpenRead(file))
-                return BitConverter.ToString(h.ComputeHash(f)).Replace("-", "");
+                return BitConverter.ToString(h.ComputeHash(stream)).Replace("-", "");
         }
 
         static void TryDelete(string dir) { try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch (Exception) { } }

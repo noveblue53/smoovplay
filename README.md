@@ -22,7 +22,7 @@
 
 ## Install the Xbox branch on Windows
 
-Sign in to the fork as its owner and open the **SmoovPlay Xbox 0.3.11-xbox.1** draft. Download **SmoovPlay-Xbox-Setup.exe** under **Assets** and run the setup wizard. It installs its own Python and GPU packages and adds **SmoovPlay Xbox** to Start. Allow about 12 GB of free space during setup. [Fork releases](https://github.com/noveblue53/smoovplay/releases)
+Download **SmoovPlay-Xbox-Web-Setup.exe** on your Windows PC and run the setup wizard. It downloads the shared files from the official v0.3.11 release, checks their SHA-256, installs its own Python and GPU packages, and adds **SmoovPlay Xbox** to Start. Allow about 12 GB of free space during setup. [Download the Xbox branch installer](https://github.com/noveblue53/smoovplay/raw/refs/heads/xbox-series-x-1440p/downloads/SmoovPlay-Xbox-Web-Setup.exe)
 
 Start Remote Play in the Windows Xbox app and leave the stream visible. Open **SmoovPlay Xbox**, confirm **App window** shows the Xbox app, and press **Play**. The first launch uses the 60 fps RTX 4070 Ti profile with RIFE 4.22 Lite and FSR 1. The Xbox app handles the controller and audio.
 

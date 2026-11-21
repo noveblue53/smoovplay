@@ -2,15 +2,17 @@
 
     .venv\\Scripts\\python installer\\build.py                    # both, into installer\\dist
     .venv\\Scripts\\python installer\\build.py --launcher-only    # just SmoovPlay.exe, for trying the launcher
+    .venv\\Scripts\\python installer\\build.py --web-setup        # small Xbox installer with the fork's app and launcher
 
 The setup is signed for updates (SmoovPlay-Setup.exe.sig, which goes up to the release with it): the launcher
 installs an update only if its signature checks out against the public key built into it. The private key stays on
-this PC, outside the repo: %USERPROFILE%\\.smoovplay\\update-signing-key.xml (SMOOVPLAY_SIGNING_KEY overrides
+this PC, outside the repo: %USERPROFILE%\\.smoovplay-xbox\\update-signing-key.xml (SMOOVPLAY_SIGNING_KEY overrides
 it), made by the first build. Back it up: without it, installed copies can't update themselves (a new setup run by
 hand still updates them).
 
-Needs the C# compiler that ships with Visual Studio 2019+ Build Tools (Roslyn csc), the patched chiaki-ng build
-(chiaki_tap/build_windows.sh output) and its source checkout (for the licence texts and the patch). The setup
+Needs the C# compiler that ships with Visual Studio 2019+ Build Tools (Roslyn csc). The full build also needs
+the patched chiaki-ng build (chiaki_tap/build_windows.sh output), its source checkout and the RIFE weights.
+The web setup obtains those assets from the verified upstream release during installation. The full setup
 contains only our code, the RIFE weights and chiaki-ng: Python, PyTorch, TensorRT and PyAV are downloaded by
 setup from their official sources, so they're never redistributed.
 """
@@ -135,13 +137,14 @@ def csc() -> Path:
     sys.exit("[build] no Roslyn csc.exe found; install Visual Studio Build Tools (the .NET desktop workload)")
 
 
-def compile_exe(out: Path, sources: list[Path], icon: Path, resource: Path | None = None) -> None:
+def compile_exe(out: Path, sources: list[Path], icon: Path, resource: Path | None = None,
+                resource_name: str = "payload.zip") -> None:
     args = [str(csc()), "/nologo", "/target:winexe", "/optimize+", "/langversion:7.3", "/platform:anycpu",
             f"/out:{out}", f"/win32icon:{icon}", f"/win32manifest:{HERE / 'launcher' / 'app.manifest'}"]
     args += [f"/reference:{r}" for r in REFS]
     args.append(f"/resource:{HERE / 'launcher' / 'Ui.xaml'},Ui.xaml")  # the window, loaded at run time
     if resource is not None:
-        args.append(f"/resource:{resource},payload.zip")
+        args.append(f"/resource:{resource},{resource_name}")
     args += [str(s) for s in sources]
     res = subprocess.run(args, capture_output=True, text=True)
     if res.returncode != 0 or "warning" in res.stdout:
@@ -189,7 +192,8 @@ def ignore_pycache(_dir: str, names: list[str]) -> list[str]:
     return [n for n in names if n == "__pycache__" or n.endswith((".pyc", ".pyo"))]
 
 
-def stage_payload(stage: Path, launcher: Path, chiaki_build: Path, chiaki_src: Path) -> None:
+def stage_app(stage: Path, launcher: Path) -> None:
+    """The branch's application and launcher, shared by both setups."""
     if stage.exists():
         shutil.rmtree(stage)
     app = stage / "app"
@@ -198,15 +202,20 @@ def stage_payload(stage: Path, launcher: Path, chiaki_build: Path, chiaki_src: P
     shutil.copytree(ROOT / "framegen", app / "framegen", ignore=ignore_pycache)
     (app / "profiles").mkdir()
     shutil.copy2(ROOT / "profiles" / "xbox-4070ti.json", app / "profiles")
+    shutil.copy2(HERE / "requirements-runtime.txt", app)
+    shutil.copy2(launcher, stage / "SmoovPlay.exe")
+
+
+def stage_payload(stage: Path, launcher: Path, chiaki_build: Path, chiaki_src: Path) -> None:
+    stage_app(stage, launcher)
+    app = stage / "app"
     (app / "models").mkdir()
     model = ROOT / "models" / MODEL
     if not model.exists():
         sys.exit(f"[build] {model} is missing (run the pipeline once to download it)")
     shutil.copy2(model, app / "models")
-    shutil.copy2(HERE / "requirements-runtime.txt", app)
     shutil.copy2(ROOT / "LICENSE", stage / "LICENSE.txt")
     shutil.copy2(HERE / "THIRD_PARTY_NOTICES.txt", stage)
-    shutil.copy2(launcher, stage / "SmoovPlay.exe")
 
     # chiaki-ng: the deployed build, its licences and the source of our patch (AGPL: corresponding source).
     chiaki = stage / "chiaki"
@@ -253,7 +262,10 @@ def zip_dir(src: Path, out: Path) -> None:
 def main() -> int:
     global VERSION
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--launcher-only", action="store_true", help="build only SmoovPlay.exe")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--launcher-only", action="store_true", help="build only SmoovPlay.exe")
+    mode.add_argument("--web-setup", action="store_true", help="build SmoovPlay-Xbox-Web-Setup.exe, which fetches "
+                      "the pinned upstream runtime assets at install time")
     ap.add_argument("--version", default=VERSION, help=f"the version to build (default {VERSION}), e.g. 0.2.0-beta.1")
     ap.add_argument("--chiaki-build", type=Path, default=os.environ.get("SMOOVPLAY_CHIAKI_BUILD"),
                     help="the patched chiaki-ng build folder (chiaki_tap/build_windows.sh output); "
@@ -276,18 +288,24 @@ def main() -> int:
     compile_exe(launcher, sources, icon)
     if a.launcher_only:
         return 0
-    if a.chiaki_build is None or a.chiaki_src is None:
-        sys.exit("[build] say where chiaki-ng is: --chiaki-build and --chiaki-src, or set SMOOVPLAY_CHIAKI_BUILD "
-                 "and SMOOVPLAY_CHIAKI_SRC")
-    for p, what in ((a.chiaki_build / "chiaki.exe", "chiaki-ng build"), (a.chiaki_src / "COPYING", "chiaki-ng source")):
-        if not p.exists():
-            sys.exit(f"[build] {what} not found ({p})")
-    stage = BUILD / "stage"
-    stage_payload(stage, launcher, a.chiaki_build, a.chiaki_src)
-    payload = BUILD / "payload.zip"
+    if a.web_setup:
+        stage = BUILD / "stage-web"
+        stage_app(stage, launcher)
+        payload, setup = BUILD / "xbox-app.zip", DIST / "SmoovPlay-Xbox-Web-Setup.exe"
+    else:
+        if a.chiaki_build is None or a.chiaki_src is None:
+            sys.exit("[build] say where chiaki-ng is: --chiaki-build and --chiaki-src, or set SMOOVPLAY_CHIAKI_BUILD "
+                     "and SMOOVPLAY_CHIAKI_SRC")
+        for p, what in ((a.chiaki_build / "chiaki.exe", "chiaki-ng build"),
+                        (a.chiaki_src / "COPYING", "chiaki-ng source")):
+            if not p.exists():
+                sys.exit(f"[build] {what} not found ({p})")
+        stage = BUILD / "stage"
+        stage_payload(stage, launcher, a.chiaki_build, a.chiaki_src)
+        payload, setup = BUILD / "payload.zip", DIST / "SmoovPlay-Setup.exe"
     zip_dir(stage, payload)
-    compile_exe(DIST / "SmoovPlay-Setup.exe", sources, icon, resource=payload)
-    sign(tool, DIST / "SmoovPlay-Setup.exe")
+    compile_exe(setup, sources, icon, resource=payload, resource_name=payload.name)
+    sign(tool, setup)
     return 0
 
 
