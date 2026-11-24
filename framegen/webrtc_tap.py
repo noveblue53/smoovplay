@@ -259,16 +259,22 @@ class WebRtcTapBridge:
         self.host = host
         self.port = port
         self._owns_tap = tap is None
-        self.tap = tap if tap is not None else FrameTap(tap_name, tap_name + "-frame")
+        self.tap: FrameTap | None = tap
         self._srv: socket.socket | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._clients: set[socket.socket] = set()
+        self._client_threads: set[threading.Thread] = set()
         self._clients_lock = threading.Lock()
         self.frames_received = 0
         self.bytes_received = 0
         self.active = False
         self.last_stats: dict | None = None
+
+    def _ensure_tap(self) -> FrameTap:
+        if self.tap is None:
+            self.tap = FrameTap(self.tap_name, self.tap_name + "-frame")
+        return self.tap
 
     def start(self) -> int:
         """Bind and start serving in a background daemon thread. Returns the bound TCP port."""
@@ -288,6 +294,7 @@ class WebRtcTapBridge:
         self._stop.set()
         with self._clients_lock:
             clients = list(self._clients)
+            threads = list(self._client_threads)
         for c in clients:
             try:
                 c.close()
@@ -302,15 +309,23 @@ class WebRtcTapBridge:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
-        try:
-            self.tap.end()
-        except Exception:  # noqa: BLE001
-            pass
-        if self._owns_tap:
+        for t in threads:
+            if t is not threading.current_thread():
+                t.join(timeout=1.0)
+        # Only end the shared-memory tap if a browser client is still actively streaming through
+        # this bridge; otherwise we would clobber an external native writer (e.g. smoovplay-xbox.exe).
+        if self.active and self.tap is not None:
+            self.active = False
+            try:
+                self.tap.end()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._owns_tap and self.tap is not None:
             try:
                 self.tap.close()
             except Exception:  # noqa: BLE001
                 pass
+            self.tap = None
 
     def _accept_loop(self) -> None:
         assert self._srv is not None
@@ -325,10 +340,12 @@ class WebRtcTapBridge:
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 pass
+            t = threading.Thread(target=self._handle_client, args=(conn, addr),
+                                 name="webrtc-tap-client", daemon=True)
             with self._clients_lock:
                 self._clients.add(conn)
-            threading.Thread(target=self._handle_client, args=(conn, addr),
-                             name="webrtc-tap-client", daemon=True).start()
+                self._client_threads.add(t)
+            t.start()
 
     def _handle_client(self, conn: socket.socket, addr) -> None:
         try:
@@ -337,8 +354,10 @@ class WebRtcTapBridge:
             if not self._stop.is_set():
                 print(f"[webrtc-tap] client {addr[0]}:{addr[1]} disconnected: {e}")
         finally:
+            me = threading.current_thread()
             with self._clients_lock:
                 self._clients.discard(conn)
+                self._client_threads.discard(me)
             try:
                 conn.close()
             except OSError:
@@ -361,7 +380,7 @@ class WebRtcTapBridge:
         def begin_stream(w: int, h: int) -> None:
             nonlocal started, width, height, prev_rtp, last_audio_delay
             width, height = w, h
-            self.tap.begin(codec, width, height, max_fps=fps, features=feats)
+            self._ensure_tap().begin(codec, width, height, max_fps=fps, features=feats)
             started, self.active, prev_rtp, last_audio_delay = True, True, None, -1
             print(f"[webrtc-tap] stream started: {codec_name.upper()} {width}x{height} @ {fps} fps -> {self.tap_name}")
 
@@ -374,10 +393,11 @@ class WebRtcTapBridge:
             nonlocal last_audio_delay
             while not self._stop.is_set() and not client_done.is_set():
                 try:
-                    if started:
-                        if self.tap.take_idr_request():
+                    tap = self.tap
+                    if started and tap is not None:
+                        if tap.take_idr_request():
                             send_json({"type": "idr"})
-                        delay = self.tap.audio_delay_ms()
+                        delay = tap.audio_delay_ms()
                         if delay != last_audio_delay:
                             last_audio_delay = delay
                             send_json({"type": "audio_delay", "ms": delay})

@@ -647,7 +647,7 @@ def main() -> int:
         choices["hz"] = (60,)
         unavailable["hz"] = "90/120 fps can't be recorded with --out yet."
     tap_overlay = None
-    if webrtc_bridge is not None:
+    if webrtc_bridge is not None and webrtc_bridge.active:
         from framegen.webrtc_tap import find_webview_overlay
         tap_overlay = find_webview_overlay()
         if tap_overlay is not None:

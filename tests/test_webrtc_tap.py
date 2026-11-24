@@ -363,3 +363,103 @@ def test_keyframe_skips_probe_when_param_sets_unchanged(monkeypatch):
         bridge.stop()
 
 
+def test_stop_does_not_clobber_tap_when_no_browser_streamed():
+    end_calls = 0
+
+    class _SpyTap:
+        def begin(self, *args, **kwargs):
+            pass
+
+        def push(self, *args, **kwargs):
+            pass
+
+        def end(self):
+            nonlocal end_calls
+            end_calls += 1
+
+        def close(self):
+            pass
+
+        def take_idr_request(self):
+            return False
+
+        def audio_delay_ms(self):
+            return 0
+
+    # 1. No client ever connected -> stop() must NOT call tap.end()
+    bridge = WebRtcTapBridge(port=0, tap=_SpyTap())
+    bridge.start()
+    bridge.stop()
+    assert end_calls == 0
+
+    # 2. Idle client connected (no "start" / frames) -> stop() must NOT call tap.end()
+    bridge = WebRtcTapBridge(port=0, tap=_SpyTap())
+    port = bridge.start()
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+    try:
+        _client_handshake(sock)
+        time.sleep(0.05)
+    finally:
+        bridge.stop()
+        sock.close()
+    assert end_calls == 0
+
+    # 3. Lazy default tap (tap=None): never even opens FrameTap when no client streams
+    lazy_bridge = WebRtcTapBridge(port=0)
+    lazy_bridge.start()
+    assert lazy_bridge.tap is None
+    lazy_bridge.stop()
+    assert lazy_bridge.tap is None
+
+
+def test_stop_does_not_double_end_after_browser_already_stopped():
+    end_calls = 0
+
+    class _SpyTap:
+        def begin(self, *args, **kwargs):
+            pass
+
+        def push(self, *args, **kwargs):
+            pass
+
+        def end(self):
+            nonlocal end_calls
+            end_calls += 1
+
+        def close(self):
+            pass
+
+        def take_idr_request(self):
+            return False
+
+        def audio_delay_ms(self):
+            return 0
+
+    bridge = WebRtcTapBridge(port=0, tap=_SpyTap())
+    port = bridge.start()
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+    try:
+        _client_handshake(sock)
+        mask = b"\x09\x0A\x0B\x0C"
+        sock.sendall(ws_encode_frame(
+            0x1,
+            json.dumps({"type": "start", "codec": "h264", "width": 1920, "height": 1080, "fps": 60}).encode(),
+            mask=mask,
+        ))
+        deadline = time.perf_counter() + 2.0
+        while not bridge.active and time.perf_counter() < deadline:
+            time.sleep(0.01)
+        assert bridge.active
+
+        # Client sends explicit stop -> tap.end() called once
+        sock.sendall(ws_encode_frame(0x1, json.dumps({"type": "stop"}).encode(), mask=mask))
+        deadline = time.perf_counter() + 2.0
+        while bridge.active and time.perf_counter() < deadline:
+            time.sleep(0.01)
+        assert not bridge.active
+        assert end_calls == 1
+    finally:
+        sock.close()
+        bridge.stop()
+    # bridge.stop() must NOT call tap.end() a second time (which could clobber a native writer)
+    assert end_calls == 1
