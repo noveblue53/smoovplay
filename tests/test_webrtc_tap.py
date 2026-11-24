@@ -17,6 +17,7 @@ from framegen.webrtc_tap import (
     WebRtcTapBridge,
     _FRAME_HDR,
     _WS_GUID,
+    format_webrtc_stats,
     infer_lost_frames,
     ws_encode_frame,
     ws_recv_message,
@@ -220,3 +221,82 @@ def test_idle_client_does_not_block_active_stream():
         active.close()
         bridge.stop()
         tap_reader.close()
+
+
+def test_format_webrtc_stats():
+    assert format_webrtc_stats({
+        "rtt_ms": 14.2,
+        "jb_ms": 4.1,
+        "jb_target_ms": 0.0,
+        "jb_min_ms": 2.0,
+        "jitter_ms": 1.3,
+        "audio_jb_ms": 12.5,
+        "fps": 59.9,
+        "packets_lost": 0,
+        "frames_dropped": 0,
+    }) == "rtt=14.2ms jb=4.1ms (target=0.0ms min=2.0ms) jitter=1.3ms audio_jb=12.5ms fps=60 lost=0"
+
+    assert format_webrtc_stats({
+        "rtt_ms": 8.0,
+        "jb_ms": 3.5,
+        "frames_dropped": 2,
+    }) == "rtt=8.0ms jb=3.5ms dropped=2"
+
+    # Booleans, None, and non-finite numbers are ignored
+    assert format_webrtc_stats({
+        "rtt_ms": float("nan"),
+        "jb_ms": True,
+        "jitter_ms": None,
+        "fps": float("inf"),
+    }) == ""
+
+
+def test_webrtc_tap_bridge_logs_stats(capsys):
+    class _DummyTap:
+        def begin(self, *args, **kwargs):
+            pass
+
+        def push(self, *args, **kwargs):
+            pass
+
+        def end(self):
+            pass
+
+        def close(self):
+            pass
+
+        def take_idr_request(self):
+            return False
+
+        def audio_delay_ms(self):
+            return 0
+
+    bridge = WebRtcTapBridge(port=0, tap=_DummyTap())
+    port = bridge.start()
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+    try:
+        _client_handshake(sock)
+        mask = b"\x01\x02\x03\x04"
+        stats_msg = {
+            "type": "stats",
+            "rtt_ms": 14.2,
+            "jb_ms": 4.1,
+            "jb_target_ms": 0.0,
+            "jb_min_ms": 2.0,
+            "jitter_ms": 1.3,
+            "audio_jb_ms": 12.5,
+            "fps": 60,
+            "packets_lost": 0,
+            "frames_dropped": 0,
+        }
+        sock.sendall(ws_encode_frame(0x1, json.dumps(stats_msg).encode("utf-8"), mask=mask))
+        deadline = time.perf_counter() + 2.0
+        while bridge.last_stats is None and time.perf_counter() < deadline:
+            time.sleep(0.01)
+        assert bridge.last_stats == stats_msg
+        out = capsys.readouterr().out
+        assert "[webrtc-tap] webrtc: rtt=14.2ms jb=4.1ms (target=0.0ms min=2.0ms) jitter=1.3ms audio_jb=12.5ms fps=60 lost=0" in out
+    finally:
+        sock.close()
+        bridge.stop()
+

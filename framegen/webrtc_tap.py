@@ -12,6 +12,8 @@ Wire protocol (client -> bridge):
   - Text frame (JSON):
       {"type": "start", "codec": "h264"|"h265"|"h265_hdr", "width": 1920, "height": 1080, "fps": 60,
        "audio_sync": true}
+      {"type": "stats", "rtt_ms": ..., "jb_ms": ..., "jb_target_ms": ..., "jb_min_ms": ...,
+       "jitter_ms": ..., "audio_jb_ms": ..., "fps": ..., "packets_lost": ..., "frames_dropped": ...}
       {"type": "stop"}
   - Binary frame (12-byte little-endian header + raw Annex-B compressed bitstream):
       u32 flags          bit 0: keyframe (IDR), bit 1: recovered
@@ -34,6 +36,7 @@ import base64
 import ctypes
 import hashlib
 import json
+import math
 import socket
 import struct
 import sys
@@ -202,6 +205,51 @@ def infer_lost_frames(prev_rtp: int | None, rtp: int, fps: int) -> int:
     return max(0, missed) if delta > step * 1.6 else 0
 
 
+def _finite_num(value) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        f = float(value)
+        if math.isfinite(f):
+            return f
+    return None
+
+
+def format_webrtc_stats(stats: dict) -> str:
+    """Format a live WebRTC RTT / jitter-buffer stats message from the tap script into one log line."""
+    parts: list[str] = []
+    rtt = _finite_num(stats.get("rtt_ms"))
+    if rtt is not None:
+        parts.append(f"rtt={rtt:.1f}ms")
+    jb = _finite_num(stats.get("jb_ms"))
+    if jb is not None:
+        jb_str = f"jb={jb:.1f}ms"
+        sub: list[str] = []
+        jb_target = _finite_num(stats.get("jb_target_ms"))
+        if jb_target is not None:
+            sub.append(f"target={jb_target:.1f}ms")
+        jb_min = _finite_num(stats.get("jb_min_ms"))
+        if jb_min is not None:
+            sub.append(f"min={jb_min:.1f}ms")
+        if sub:
+            jb_str += f" ({' '.join(sub)})"
+        parts.append(jb_str)
+    jitter = _finite_num(stats.get("jitter_ms"))
+    if jitter is not None:
+        parts.append(f"jitter={jitter:.1f}ms")
+    audio_jb = _finite_num(stats.get("audio_jb_ms"))
+    if audio_jb is not None:
+        parts.append(f"audio_jb={audio_jb:.1f}ms")
+    fps = _finite_num(stats.get("fps"))
+    if fps is not None:
+        parts.append(f"fps={round(fps)}")
+    lost = _finite_num(stats.get("packets_lost"))
+    if lost is not None:
+        parts.append(f"lost={int(lost)}")
+    dropped = _finite_num(stats.get("frames_dropped"))
+    if dropped is not None and dropped > 0:
+        parts.append(f"dropped={int(dropped)}")
+    return " ".join(parts)
+
+
 class WebRtcTapBridge:
     """Listens on 127.0.0.1:<port> for WebRTC Encoded Streams and writes them into a SmoovPlay FrameTap."""
 
@@ -220,6 +268,7 @@ class WebRtcTapBridge:
         self.frames_received = 0
         self.bytes_received = 0
         self.active = False
+        self.last_stats: dict | None = None
 
     def start(self) -> int:
         """Bind and start serving in a background daemon thread. Returns the bound TCP port."""
@@ -362,6 +411,11 @@ class WebRtcTapBridge:
                         else:
                             pending_start = None
                             begin_stream(w, h)
+                    elif kind == "stats":
+                        self.last_stats = ctrl
+                        line = format_webrtc_stats(ctrl)
+                        if line:
+                            print(f"[webrtc-tap] webrtc: {line}")
                     elif kind == "stop":
                         pending_start = None
                         if started:

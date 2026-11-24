@@ -21,6 +21,16 @@
   // play.xbox.com starts muted or Skip browser decode stalls <video>'s A/V sync clock.
   const directAudioEnabled = () => window.SMOOVPLAY_DIRECT_AUDIO !== false;
 
+  // Target 0 ms WebRTC jitter buffer / playout delay by default; set to false to keep browser defaults.
+  const zeroJitterBuffer = () => window.SMOOVPLAY_ZERO_JITTER_BUFFER !== false;
+  // Live WebRTC RTT / jitter-buffer stats logging interval in ms (0 disables).
+  const statsIntervalMs = () => {
+    const raw = window.SMOOVPLAY_STATS_INTERVAL_MS;
+    if (raw === undefined) return 2000;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : 2000;
+  };
+
   let ws = null;
   let wsOpen = false;
   let started = false;
@@ -36,10 +46,212 @@
   let framesSent = 0;
   let lastKeyframe = null; // { data: Uint8Array, timestamp: number } for instant mid-stream attach
   let videoPc = null;
+  let videoReceiver = null;
+  let audioReceiver = null;
+  let statsTimer = null;
+  let statsInFlight = false;
+  let prevStats = null;
   const seenMedia = new Set();
 
   function log(...args) {
     console.log("[smoovplay-tap]", ...args);
+  }
+
+  function applyLowLatencyReceiver(receiver, label) {
+    if (!receiver || !zeroJitterBuffer()) return;
+    const applied = [];
+    if ("jitterBufferTarget" in receiver) {
+      try {
+        if (receiver.jitterBufferTarget !== 0) {
+          receiver.jitterBufferTarget = 0;
+          applied.push("jitterBufferTarget=0");
+        }
+      } catch (err) {
+        log(`failed to set ${label} jitterBufferTarget=0:`, err);
+      }
+    }
+    if ("playoutDelayHint" in receiver) {
+      try {
+        if (receiver.playoutDelayHint !== 0) {
+          receiver.playoutDelayHint = 0;
+          applied.push("playoutDelayHint=0");
+        }
+      } catch (err) {
+        log(`failed to set ${label} playoutDelayHint=0:`, err);
+      }
+    }
+    if (applied.length > 0) {
+      log(`${label} receiver low-latency:`, applied.join(", "));
+    }
+  }
+
+  function round1(val) {
+    return typeof val === "number" && Number.isFinite(val) ? Math.round(val * 10) / 10 : null;
+  }
+
+  function intervalAvgMs(curSum, prevSum, curCount, prevCount) {
+    if (typeof curSum !== "number" || typeof curCount !== "number" || curCount <= 0) return null;
+    if (typeof prevSum === "number" && typeof prevCount === "number") {
+      if (curCount > prevCount && curSum >= prevSum) {
+        return round1(((curSum - prevSum) / (curCount - prevCount)) * 1000);
+      }
+      if (curCount === prevCount) return null;
+    }
+    return round1((curSum / curCount) * 1000);
+  }
+
+  function formatStatsLine(s) {
+    const parts = [];
+    if (s.rtt_ms != null) parts.push(`rtt=${s.rtt_ms.toFixed(1)}ms`);
+    if (s.jb_ms != null) {
+      let jb = `jb=${s.jb_ms.toFixed(1)}ms`;
+      const sub = [];
+      if (s.jb_target_ms != null) sub.push(`target=${s.jb_target_ms.toFixed(1)}ms`);
+      if (s.jb_min_ms != null) sub.push(`min=${s.jb_min_ms.toFixed(1)}ms`);
+      if (sub.length > 0) jb += ` (${sub.join(" ")})`;
+      parts.push(jb);
+    }
+    if (s.jitter_ms != null) parts.push(`jitter=${s.jitter_ms.toFixed(1)}ms`);
+    if (s.audio_jb_ms != null) parts.push(`audio_jb=${s.audio_jb_ms.toFixed(1)}ms`);
+    if (s.fps != null) parts.push(`fps=${Math.round(s.fps)}`);
+    if (s.packets_lost != null) parts.push(`lost=${s.packets_lost}`);
+    if (s.frames_dropped != null && s.frames_dropped > 0) parts.push(`dropped=${s.frames_dropped}`);
+    return parts.join(" ");
+  }
+
+  async function pollWebRtcStats(pc) {
+    if (!pc || pc !== videoPc || statsInFlight) return;
+    statsInFlight = true;
+    try {
+      // Re-enforce 0 ms jitter buffer hints in case the page overwrites them mid-stream.
+      applyLowLatencyReceiver(videoReceiver, "video");
+      applyLowLatencyReceiver(audioReceiver, "audio");
+
+      const report = await pc.getStats();
+      let selectedPairId = null;
+      let pair = null;
+      let remoteOutboundRtt = null;
+      let videoIn = null;
+      let audioIn = null;
+
+      report.forEach((s) => {
+        if (s.type === "transport" && s.selectedCandidatePairId) {
+          selectedPairId = s.selectedCandidatePairId;
+        } else if (s.type === "inbound-rtp") {
+          const kind = s.kind || s.mediaType;
+          if (kind === "video") videoIn = s;
+          else if (kind === "audio") audioIn = s;
+        } else if (s.type === "remote-outbound-rtp" && typeof s.roundTripTime === "number") {
+          remoteOutboundRtt = s.roundTripTime;
+        }
+      });
+
+      if (selectedPairId && typeof report.get === "function") {
+        pair = report.get(selectedPairId) || null;
+      }
+      if (!pair) {
+        report.forEach((s) => {
+          if (s.type !== "candidate-pair" || s.state !== "succeeded") return;
+          if (!pair || (s.nominated && !pair.nominated)) {
+            pair = s;
+          }
+        });
+      }
+
+      let rttMs = null;
+      if (pair && typeof pair.currentRoundTripTime === "number") {
+        rttMs = round1(pair.currentRoundTripTime * 1000);
+      } else if (remoteOutboundRtt !== null) {
+        rttMs = round1(remoteOutboundRtt * 1000);
+      }
+
+      const prev = prevStats;
+      const stats = {
+        rtt_ms: rttMs,
+        jb_ms: videoIn
+          ? intervalAvgMs(
+              videoIn.jitterBufferDelay,
+              prev && prev.vJbDelay,
+              videoIn.jitterBufferEmittedCount,
+              prev && prev.vJbEmitted
+            )
+          : null,
+        jb_target_ms: videoIn
+          ? intervalAvgMs(
+              videoIn.jitterBufferTargetDelay,
+              prev && prev.vJbTargetDelay,
+              videoIn.jitterBufferEmittedCount,
+              prev && prev.vJbEmitted
+            )
+          : null,
+        jb_min_ms: videoIn
+          ? intervalAvgMs(
+              videoIn.jitterBufferMinimumDelay,
+              prev && prev.vJbMinDelay,
+              videoIn.jitterBufferEmittedCount,
+              prev && prev.vJbEmitted
+            )
+          : null,
+        jitter_ms: videoIn && typeof videoIn.jitter === "number" ? round1(videoIn.jitter * 1000) : null,
+        audio_jb_ms: audioIn
+          ? intervalAvgMs(
+              audioIn.jitterBufferDelay,
+              prev && prev.aJbDelay,
+              audioIn.jitterBufferEmittedCount,
+              prev && prev.aJbEmitted
+            )
+          : null,
+        fps: videoIn && typeof videoIn.framesPerSecond === "number" ? round1(videoIn.framesPerSecond) : null,
+        packets_lost: videoIn && typeof videoIn.packetsLost === "number" ? videoIn.packetsLost : null,
+        frames_dropped: videoIn && typeof videoIn.framesDropped === "number" ? videoIn.framesDropped : null,
+      };
+
+      if (videoReceiver && "jitterBufferTarget" in videoReceiver) {
+        stats.jb_target_prop = videoReceiver.jitterBufferTarget;
+      }
+      if (videoReceiver && "playoutDelayHint" in videoReceiver) {
+        stats.playout_delay_hint = videoReceiver.playoutDelayHint;
+      }
+
+      prevStats = {
+        vJbDelay: videoIn ? videoIn.jitterBufferDelay : undefined,
+        vJbTargetDelay: videoIn ? videoIn.jitterBufferTargetDelay : undefined,
+        vJbMinDelay: videoIn ? videoIn.jitterBufferMinimumDelay : undefined,
+        vJbEmitted: videoIn ? videoIn.jitterBufferEmittedCount : undefined,
+        aJbDelay: audioIn ? audioIn.jitterBufferDelay : undefined,
+        aJbEmitted: audioIn ? audioIn.jitterBufferEmittedCount : undefined,
+      };
+
+      const line = formatStatsLine(stats);
+      if (line) {
+        log("webrtc:", line);
+        if (wsOpen && ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(Object.assign({ type: "stats" }, stats)));
+        }
+      }
+    } catch (err) {
+      log("stats poll failed:", err && err.message ? err.message : err);
+    } finally {
+      statsInFlight = false;
+    }
+  }
+
+  function stopStatsLogging() {
+    if (statsTimer !== null) {
+      clearInterval(statsTimer);
+      statsTimer = null;
+    }
+    statsInFlight = false;
+    prevStats = null;
+  }
+
+  function startStatsLogging(pc) {
+    stopStatsLogging();
+    const interval = statsIntervalMs();
+    if (!pc || typeof pc.getStats !== "function" || interval <= 0) return;
+    statsTimer = setInterval(() => {
+      pollWebRtcStats(pc);
+    }, interval);
   }
 
   function muteForeignMediaElement(el) {
@@ -196,6 +408,8 @@
   function attachVideoReceiver(receiver) {
     if (receiver.__smoovplayTapped) return;
     receiver.__smoovplayTapped = true;
+    videoReceiver = receiver;
+    applyLowLatencyReceiver(receiver, "video");
     if (typeof receiver.createEncodedStreams !== "function") {
       log("receiver.createEncodedStreams() is not available in this browser");
       return;
@@ -223,6 +437,8 @@
   function passThroughAudioReceiver(receiver) {
     if (!receiver || receiver.__smoovplayAudioTapped) return;
     receiver.__smoovplayAudioTapped = true;
+    audioReceiver = receiver;
+    applyLowLatencyReceiver(receiver, "audio");
     if (typeof receiver.createEncodedStreams !== "function") return;
     try {
       const { readable, writable } = receiver.createEncodedStreams();
@@ -335,6 +551,7 @@
       if (ev.track && ev.track.kind === "video" && ev.receiver) {
         videoPc = pc;
         attachVideoReceiver(ev.receiver);
+        startStatsLogging(pc);
       } else if (ev.track && ev.track.kind === "audio") {
         if (ev.receiver) passThroughAudioReceiver(ev.receiver);
         attachAudioTrack(ev.track, pc);
@@ -343,10 +560,13 @@
     pc.addEventListener("connectionstatechange", () => {
       if (pc.connectionState === "closed" || pc.connectionState === "disconnected") {
         if (pc === audioPc) {
+          audioReceiver = null;
           detachAudio();
         }
         if (pc === videoPc) {
+          stopStatsLogging();
           videoPc = null;
+          videoReceiver = null;
           lastKeyframe = null;
           if (wsOpen && started) {
             ws.send(JSON.stringify({ type: "stop" }));
