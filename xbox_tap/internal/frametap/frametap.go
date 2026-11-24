@@ -97,6 +97,7 @@ func (w *Writer) Begin(codec, width, height, maxFPS, features uint32) {
 	binary.LittleEndian.PutUint32(w.mem[44:48], w.session)
 	binary.LittleEndian.PutUint64(w.mem[48:56], w.qpcFreq)
 	binary.LittleEndian.PutUint32(w.mem[64:68], features)
+	binary.LittleEndian.PutUint32(w.mem[68:72], 0) // clear any stale press_buttons
 
 	// Publish magic last so readers see a consistent header.
 	atomic.StoreUint32(u32ptr(w.mem, 0), Magic)
@@ -146,6 +147,36 @@ func (w *Writer) TakeIDRRequest() bool {
 		return false
 	}
 	return atomic.SwapUint32(u32ptr(w.mem, 40), 0) != 0
+}
+
+// TakePressRequest atomically checks and clears SmoovPlay's delay-test button press request.
+// Returns (buttons, holdMs) where buttons is a ChiakiControllerButton bitmask (0 if none)
+// and holdMs is clamped to [20, 2000] ms (matching chiaki_tap/frametap.c).
+func (w *Writer) TakePressRequest() (buttons uint32, holdMs uint32) {
+	if len(w.mem) < HeaderSize {
+		return 0, 0
+	}
+	buttons = atomic.SwapUint32(u32ptr(w.mem, 68), 0)
+	if buttons == 0 {
+		return 0, 0
+	}
+	holdMs = atomic.LoadUint32(u32ptr(w.mem, 72))
+	if holdMs < 20 {
+		holdMs = 20
+	} else if holdMs > 2000 {
+		holdMs = 2000
+	}
+	return buttons, holdMs
+}
+
+// PressSent stamps the QPC time (offset 80) when a requested button press was sent to the
+// console and increments press_count (offset 76) so SmoovPlay's Delay Test can time it.
+func (w *Writer) PressSent() {
+	if len(w.mem) < HeaderSize {
+		return
+	}
+	atomic.StoreUint64(u64ptr(w.mem, 80), queryQPC())
+	atomic.AddUint32(u32ptr(w.mem, 76), 1)
 }
 
 // AudioDelayMs returns SmoovPlay's requested audio holdback (0–500 ms), or 0 if

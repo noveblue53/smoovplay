@@ -145,3 +145,55 @@ func ParseServerMetadata(data []byte) (width, height uint32, ok bool) {
 	width = binary.LittleEndian.Uint32(data[6:10])
 	return width, height, width > 0 && height > 0
 }
+
+// MapChiakiButtons translates a SmoovPlay/ChiakiControllerButton bitmask (used by
+// FEATURE_PRESS / Delay Test, e.g. BUTTON_OPTIONS = 1<<12 -> BtnMenu) into Xbox wire button bits.
+func MapChiakiButtons(chiakiMask uint32) uint16 {
+	var out uint16
+	if chiakiMask&(1<<0) != 0 {
+		out |= BtnA // Cross
+	}
+	if chiakiMask&(1<<1) != 0 {
+		out |= BtnB // Circle
+	}
+	if chiakiMask&(1<<2) != 0 {
+		out |= BtnX // Square
+	}
+	if chiakiMask&(1<<3) != 0 {
+		out |= BtnY // Triangle
+	}
+	if chiakiMask&(1<<4) != 0 {
+		out |= BtnDPadLeft
+	}
+	if chiakiMask&(1<<5) != 0 {
+		out |= BtnDPadRight
+	}
+	if chiakiMask&(1<<6) != 0 {
+		out |= BtnDPadUp
+	}
+	if chiakiMask&(1<<7) != 0 {
+		out |= BtnDPadDown
+	}
+	if chiakiMask&(1<<8) != 0 {
+		out |= BtnLeftShoulder // L1
+	}
+	if chiakiMask&(1<<9) != 0 {
+		out |= BtnRightShoulder // R1
+	}
+	if chiakiMask&(1<<10) != 0 {
+		out |= BtnLeftThumb // L3
+	}
+	if chiakiMask&(1<<11) != 0 {
+		out |= BtnRightThumb // R3
+	}
+	if chiakiMask&(1<<12) != 0 {
+		out |= BtnMenu // Options (SmoovPlay Delay Test default)
+	}
+	if chiakiMask&(1<<13) != 0 {
+		out |= BtnView // Share
+	}
+	if chiakiMask&(1<<15) != 0 {
+		out |= BtnNexus // PS / Guide
+	}
+	return out
+}

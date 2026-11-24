@@ -91,3 +91,54 @@ func TestFrameTapHeaderAndSlotLayout(t *testing.T) {
 		t.Fatalf("audio payload mismatch")
 	}
 }
+
+func TestPressBackchannel(t *testing.T) {
+	w, err := Open("test-tap-press")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer w.Close()
+
+	// Pre-populate stale press request; Begin must clear offset 68.
+	binary.LittleEndian.PutUint32(w.mem[68:72], 1<<12)
+	w.Begin(CodecH264, 1920, 1080, 60, FeaturePress|FeatureAudioDelay)
+	if btns, hold := w.TakePressRequest(); btns != 0 || hold != 0 {
+		t.Fatalf("expected stale press cleared by Begin, got (%d, %d)", btns, hold)
+	}
+
+	// Normal request (Options = 1<<12, hold 100 ms)
+	binary.LittleEndian.PutUint32(w.mem[72:76], 100)
+	binary.LittleEndian.PutUint32(w.mem[68:72], 1<<12)
+	btns, hold := w.TakePressRequest()
+	if btns != (1<<12) || hold != 100 {
+		t.Fatalf("TakePressRequest = (0x%x, %d), want (0x1000, 100)", btns, hold)
+	}
+	// Atomic clear: second call returns 0
+	if b2, h2 := w.TakePressRequest(); b2 != 0 || h2 != 0 {
+		t.Fatalf("second TakePressRequest = (%d, %d), want (0, 0)", b2, h2)
+	}
+
+	// Hold clamping: <20 -> 20, >2000 -> 2000
+	binary.LittleEndian.PutUint32(w.mem[72:76], 5)
+	binary.LittleEndian.PutUint32(w.mem[68:72], 1<<12)
+	if _, h := w.TakePressRequest(); h != 20 {
+		t.Fatalf("clamped min hold = %d, want 20", h)
+	}
+	binary.LittleEndian.PutUint32(w.mem[72:76], 9999)
+	binary.LittleEndian.PutUint32(w.mem[68:72], 1<<12)
+	if _, h := w.TakePressRequest(); h != 2000 {
+		t.Fatalf("clamped max hold = %d, want 2000", h)
+	}
+
+	// PressSent stamps QPC at offset 80 and increments press_count at offset 76
+	beforeCount := binary.LittleEndian.Uint32(w.mem[76:80])
+	w.PressSent()
+	afterCount := binary.LittleEndian.Uint32(w.mem[76:80])
+	qpcVal := binary.LittleEndian.Uint64(w.mem[80:88])
+	if afterCount != beforeCount+1 {
+		t.Fatalf("press_count = %d, want %d", afterCount, beforeCount+1)
+	}
+	if qpcVal == 0 {
+		t.Fatalf("expected non-zero QPC timestamp at offset 80")
+	}
+}

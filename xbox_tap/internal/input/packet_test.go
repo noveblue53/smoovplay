@@ -74,3 +74,21 @@ func TestParseVibrationAndServerMetadata(t *testing.T) {
 		t.Fatalf("serverMetadata = (%d, %d, %v), want (1920, 1080, true)", w, h, ok)
 	}
 }
+
+func TestMapChiakiButtons(t *testing.T) {
+	// Delay Test default: Chiaki BUTTON_OPTIONS (1<<12) -> Xbox BtnMenu
+	if got := MapChiakiButtons(1 << 12); got != BtnMenu {
+		t.Fatalf("Options -> 0x%x, want BtnMenu (0x%x)", got, BtnMenu)
+	}
+	// Chiaki BUTTON_PS (1<<15) -> Xbox BtnNexus
+	if got := MapChiakiButtons(1 << 15); got != BtnNexus {
+		t.Fatalf("PS -> 0x%x, want BtnNexus (0x%x)", got, BtnNexus)
+	}
+	// Combined buttons
+	if got := MapChiakiButtons((1 << 0) | (1 << 12) | (1 << 13)); got != (BtnA | BtnMenu | BtnView) {
+		t.Fatalf("combined -> 0x%x, want 0x%x", got, BtnA|BtnMenu|BtnView)
+	}
+	if got := MapChiakiButtons(0); got != 0 {
+		t.Fatalf("zero -> 0x%x, want 0", got)
+	}
+}

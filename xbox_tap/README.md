@@ -5,7 +5,7 @@ A standalone, zero-CGo Go client for **Xbox Remote Play (`xhome`)** and **Xbox C
 - **0 ms video jitter buffer:** reassembles RFC 6184 H.264 RTP packets directly into Annex-B frames and writes them straight into SmoovPlay's `Local\smoovplay-tap` shared-memory ring (`version 1`, same layout as `chiaki_tap/frametap.h`).
 - **Zero-decode resolution detection:** parses H.264 SPS NAL units directly in Go (1080p / 1440p) with no CPU decode spike on keyframes.
 - **Instant keyframe recovery (1 RTT):** answers SmoovPlay's `idr_request` with both RTCP PLI and Xbox's `control` channel `videoKeyframeRequested`.
-- **Native 125 Hz XInput + rumble:** reads XInput directly (`xinput1_4.dll`) and sends Xbox's binary `input` DataChannel packets, so SmoovPlay can run in **unoccluded DXGI fullscreen** instead of a click-through overlay.
+- **Native 125 Hz XInput + rumble + Delay Test (`L`):** reads XInput directly (`xinput1_4.dll`), sends Xbox's binary `input` DataChannel packets, and implements `FEATURE_PRESS` so SmoovPlay's built-in Delay Test (`L`) works natively on Xbox and SmoovPlay can run in **unoccluded DXGI fullscreen** instead of a click-through overlay.
 - **Pure-Go Opus audio + sync:** decodes 48 kHz stereo Opus via `go-opus`, writes raw PCM into SmoovPlay's `-audio` ring (for Instant Replay), applies SmoovPlay's `audio_delay_ms` holdback, and plays via Windows `waveOut`.
 - **Live WebRTC telemetry:** prints live RTT, 0 ms jitter buffer, fps, keyframes, packet loss, and audio packet counters every 2 seconds.
 

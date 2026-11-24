@@ -25,23 +25,23 @@ import (
 )
 
 const (
-	controlAccessKey        = "4BDB3609-C1F1-4195-9B37-FEFF45DA8B8E"
-	messageHandshakeID      = "be0bfc6d-1e83-4c8a-90ed-fa8601c5a179"
-	messageClientAppInstID  = "c97d7ee0-73b2-4239-bf1d-9d805a338429"
+	controlAccessKey       = "4BDB3609-C1F1-4195-9B37-FEFF45DA8B8E"
+	messageHandshakeID     = "be0bfc6d-1e83-4c8a-90ed-fa8601c5a179"
+	messageClientAppInstID = "c97d7ee0-73b2-4239-bf1d-9d805a338429"
 )
 
 // Config configures a native Xbox streaming session.
 type Config struct {
-	Kind          gssv.StreamKind // KindHome or KindCloud
-	TargetID      string          // console serverId (home) or titleId (cloud)
-	Width         int             // preferred width (default 1920)
-	Height        int             // preferred height (default 1080)
-	FPS           int             // preferred fps (default 60)
-	MaxBitrateKbps int            // SDP bitrate cap (default 20000)
-	TapName       string          // SmoovPlay shared-memory tap name (default Local\smoovplay-tap)
-	EnableAudio   bool            // decode Opus & play via Windows waveOut + AudioTap
-	StatsInterval time.Duration   // live RTT/loss/fps log interval (0 disables)
-	LPTToken      string          // xCloud Long Play Token (only required for KindCloud)
+	Kind           gssv.StreamKind // KindHome or KindCloud
+	TargetID       string          // console serverId (home) or titleId (cloud)
+	Width          int             // preferred width (default 1920)
+	Height         int             // preferred height (default 1080)
+	FPS            int             // preferred fps (default 60)
+	MaxBitrateKbps int             // SDP bitrate cap (default 20000)
+	TapName        string          // SmoovPlay shared-memory tap name (default Local\smoovplay-tap)
+	EnableAudio    bool            // decode Opus & play via Windows waveOut + AudioTap
+	StatsInterval  time.Duration   // live RTT/loss/fps log interval (0 disables)
+	LPTToken       string          // xCloud Long Play Token (only required for KindCloud)
 }
 
 // Run starts the Xbox session, connects WebRTC, streams H.264 straight into FrameTap,
@@ -207,10 +207,10 @@ func Run(ctx context.Context, client *gssv.Client, cfg Config) error {
 		}
 	})
 
-	// Input channel: 125 Hz XInput polling + rumble feedback
+	// Input channel: 125 Hz XInput polling + rumble feedback + FEATURE_PRESS delay test
 	dcInput.OnOpen(func() {
 		log.Printf("[xbox-tap] input channel open (125 Hz XInput polling)")
-		go runInputLoop(runCtx, dcInput, dcControl)
+		go runInputLoop(runCtx, dcInput, dcControl, tap)
 	})
 	dcInput.OnMessage(func(msg webrtc.DataChannelMessage) {
 		if vib, ok := input.ParseVibration(msg.Data); ok {
@@ -235,7 +235,7 @@ func Run(ctx context.Context, client *gssv.Client, cfg Config) error {
 				depacketizer := video.NewDepacketizer(cfg.FPS)
 				started := false
 				curW, curH := cfg.Width, cfg.Height
-				feats := uint32(0)
+				feats := frametap.FeaturePress
 				if audioPlayer != nil {
 					feats |= frametap.FeatureAudioDelay | frametap.FeatureAudioTap
 				}
@@ -455,7 +455,34 @@ func newPeerConnection() (*webrtc.PeerConnection, error) {
 	})
 }
 
-func runInputLoop(ctx context.Context, dcInput, dcControl *webrtc.DataChannel) {
+// syntheticPress tracks an active FEATURE_PRESS hold (SmoovPlay Delay Test).
+type syntheticPress struct {
+	buttons uint16
+	until   time.Time
+}
+
+func (s *syntheticPress) trigger(now time.Time, xboxButtons uint16, holdMs uint32) bool {
+	if xboxButtons == 0 {
+		return false
+	}
+	s.buttons |= xboxButtons
+	until := now.Add(time.Duration(holdMs) * time.Millisecond)
+	if until.After(s.until) {
+		s.until = until
+	}
+	return true
+}
+
+// step advances expiration; returns (currentButtons, releaseJustHappened).
+func (s *syntheticPress) step(now time.Time) (uint16, bool) {
+	if s.buttons != 0 && !now.Before(s.until) {
+		s.buttons = 0
+		return 0, true
+	}
+	return s.buttons, false
+}
+
+func runInputLoop(ctx context.Context, dcInput, dcControl *webrtc.DataChannel, tap *frametap.Writer) {
 	start := time.Now()
 	var seq uint32 = 1
 	// Send initial ClientMetadata packet once on open.
@@ -466,17 +493,38 @@ func runInputLoop(ctx context.Context, dcInput, dcControl *webrtc.DataChannel) {
 	defer ticker.Stop()
 
 	wasConnected := [4]bool{true, false, false, false}
+	var synth syntheticPress
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case now := <-ticker.C:
 			if dcInput.ReadyState() != webrtc.DataChannelStateOpen {
 				continue
 			}
+
+			notifyPressSent := false
+			if tap != nil {
+				if chiakiBtns, holdMs := tap.TakePressRequest(); chiakiBtns != 0 {
+					xboxBtns := input.MapChiakiButtons(chiakiBtns)
+					if synth.trigger(now, xboxBtns, holdMs) {
+						notifyPressSent = true
+					}
+				}
+			}
+			synthBtns, synthReleased := synth.step(now)
+
 			var active []input.GamepadState
 			for i := uint8(0); i < 4; i++ {
 				st := input.PollGamepad(i)
+				if i == 0 && (synthBtns != 0 || synthReleased) {
+					// Ensure virtual gamepad 0 stays attached during a synthetic press/release.
+					if !st.Connected {
+						st.Connected = true
+					}
+					st.Buttons |= synthBtns
+				}
 				if st.Connected != wasConnected[i] {
 					wasConnected[i] = st.Connected
 					sendControlJSON(dcControl, map[string]any{
@@ -493,7 +541,9 @@ func runInputLoop(ctx context.Context, dcInput, dcControl *webrtc.DataChannel) {
 				tsMs := float64(time.Since(start).Milliseconds())
 				pkt := input.EncodeGamepadPacket(seq, tsMs, active)
 				seq++
-				_ = dcInput.Send(pkt)
+				if err := dcInput.Send(pkt); err == nil && notifyPressSent && tap != nil {
+					tap.PressSent()
+				}
 			}
 		}
 	}
