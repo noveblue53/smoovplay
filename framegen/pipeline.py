@@ -5,12 +5,14 @@ from __future__ import annotations
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
+from functools import partial
 
 import numpy as np
 import torch
 
 from . import delaytest
 from .cadence import Action, CadenceScheduler, CutDetector, DipWatch, DuplicateDetector, FrameTimeline, RhythmLock
+from .gputime import TickClock
 from .hdr import level8, to_u8
 from .interpolator import STEADY_HUD_THRESHOLD, RifeInterpolator
 from .io import TICK, MiniText, Waiting
@@ -357,6 +359,23 @@ class Stats:
         return lines
 
 
+def _tick_stats(st: Stats, on_tick, tick, diff, action: Action, t0: float, t_ready: float, t_shown: float,
+                to_sink: bool, shown: list, at) -> None:
+    """A tick's timings, once its GPU work is done (TickClock.done). t_ready (processing done) and t_shown (the sink
+    gave back) are the CPU's times; at() moves them to when the generated frames queued by then were done, if that's
+    later, as no frame can be on screen before it's made. shown: (CPU time, arrival, mark) for each real frame."""
+    ready = at(t_ready)
+    proc = (ready - t0) * 1000
+    (st.proc_interp_ms if action is Action.INTERP else st.proc_other_ms).append(proc)
+    end = max(t_shown, ready)
+    st.busy_ms.append((end - t0) * 1000)
+    if to_sink:
+        st.sink_ms.append((end - ready) * 1000)
+    st.real_delay_ms.extend((at(t, k) - t_arrival) * 1000 for t, t_arrival, k in shown)
+    if on_tick is not None:
+        on_tick(tick, diff, action, proc, t0)
+
+
 class Pipeline:
     def __init__(self, interp: RifeInterpolator, detector: DuplicateDetector | None = None,
                  cut_threshold: float = 25.0) -> None:
@@ -419,7 +438,9 @@ class Pipeline:
         # A sink that takes CUDA tensors (the GL window with CUDA-GL interop) gets generated frames without a
         # GPU->CPU->GPU round trip; otherwise they're downloaded into pinned memory as before.
         gpu_out = bool(getattr(sink, "gpu", False))
-        last_proc = 0.0
+        # Those frames aren't waited for (the stream's order keeps the picture right): CUDA events time them instead,
+        # and each tick's timings (processing, display, delay, on_tick) are given once its GPU work is done.
+        clock = self._clock = TickClock(gpu_out)
         unshown: float | None = None  # arrival time of the newest real frame not yet presented as itself
         t_start = time.perf_counter()
         # Overlay: one line for every frame shown (real and in-between), refreshed a few times a second with
@@ -558,6 +579,7 @@ class Pipeline:
                 np.copyto(self._in_np, tick.frame)
                 it.load(self._in_pinned)
             diff = self.detector.update(it.in_u8)
+            clock.begin()  # (the check above waited for the GPU: this tick's GPU time starts here)
             # A source that knows better (the frame tap's flags, test mode) overrides the image check.
             is_new = diff.is_new if tick.new_hint is None else tick.new_hint
             # Dip smoothing, by the picture's own call (the 30 fps lock below can't see a dip); not in
@@ -629,6 +651,7 @@ class Pipeline:
                 st.dedup[("t" if is_new == tick.truth_new else "f") + ("p" if is_new else "n")] += 1
 
             to_score = None
+            shown = []  # (CPU time, a real frame's arrival, TickClock mark) for real_delay_ms, once the GPU is done
             early_cmd = None  # 90/120 Hz: the first of this tick's two frames, already shown
             mid_t = 0.5  # the generated frame this tick ends on
             # Behind = waiting frames, not decode time: a Remote Play frame's arrival is before its ~3-11 ms decode.
@@ -731,8 +754,8 @@ class Pipeline:
                         st.uneven_waits += pl.waiting
                         if k < len(phases) - 1:
                             early_cmd = present(frame, ov_text) or early_cmd
-                            t_now = time.perf_counter()
-                            st.real_delay_ms.extend((t_now - f.t_arrival) * 1000 for f in pl.reached)
+                            t_now, mark = time.perf_counter(), clock.last()
+                            shown.extend((t_now, f.t_arrival, mark) for f in pl.reached)
                         else:
                             out, reached = frame, pl.reached
                             action = Action.INTERP if pl.b is not None else Action.CURRENT
@@ -766,12 +789,8 @@ class Pipeline:
                 if gt_fn is not None:
                     key_gpu = it.in_u8.clone()
 
-            t_ready = time.perf_counter()
-            last_proc = (t_ready - t0) * 1000
-            (st.proc_interp_ms if action is Action.INTERP else st.proc_other_ms).append(last_proc)
+            t_ready = time.perf_counter()  # queued, at least (its timings: _tick_stats)
             st.actions[action.value] += 1
-            if on_tick is not None:
-                on_tick(tick, diff, action, last_proc, t0)
 
             cmd = None
             if sink is not None:
@@ -807,29 +826,28 @@ class Pipeline:
                     ov_text, ov_next = overlay_text(), t_ready + 0.25
                 cmd = present(out, ov_text) or early_cmd
             t_shown = time.perf_counter()
-            st.busy_ms.append((t_shown - t0) * 1000)
-            if sink is not None:
-                st.sink_ms.append((t_shown - t_ready) * 1000)
 
             if trace is not None:
                 trace.tick(tick, hz, is_new, action.value, t0, t_ready, mid_t, pl if timed else None)
 
             # Track when each real frame first reaches the screen (timed: when the game time shown reaches it).
             if timed:
-                st.real_delay_ms.extend((t_shown - f.t_arrival) * 1000 for f in reached)
+                shown.extend((t_shown, f.t_arrival, None) for f in reached)
                 reached = ()
             elif action is Action.PENDING:
                 if unshown is not None:
-                    st.real_delay_ms.append((t_shown - unshown) * 1000)
+                    shown.append((t_shown, unshown, None))
                 unshown = tick.t_arrival  # previous original shown, current original still due
             elif is_new:
                 if action is Action.CURRENT:
-                    st.real_delay_ms.append((t_shown - tick.t_arrival) * 1000)
+                    shown.append((t_shown, tick.t_arrival, None))
                 else:
                     unshown = tick.t_arrival
             elif unshown is not None:
-                st.real_delay_ms.append((t_shown - unshown) * 1000)
+                shown.append((t_shown, unshown, None))
                 unshown = None
+            clock.done(partial(_tick_stats, st, on_tick, tick, diff, action, t0, t_ready, t_shown, sink is not None,
+                               shown))
 
             if replay is not None and is_new:  # the game's own frame, for a before & after video
                 replay.real_frame(tick.frame, tick.t_arrival)
@@ -867,6 +885,7 @@ class Pipeline:
                         sched = CadenceScheduler(live_native_60)
                         print(f"[pipeline] interpolation {'ON' if enabled else 'OFF'}")
 
+        clock.flush()
         st.wall_s = time.perf_counter() - t_start
         return st
 
@@ -898,9 +917,11 @@ class Pipeline:
         return slot
 
     def _generated(self, frame: torch.Tensor, gpu_out: bool):
-        """A generated frame for the sink, waited for (a sync point, so timings are real)."""
+        """A generated frame for the sink. On the GPU it isn't waited for: everything that reads it (the CUDA-GL copy,
+        RTX VSR, Looks in clips, instant replay) is queued on the same stream after it, and a CUDA event marks when
+        it's done, for the timings (TickClock)."""
         if gpu_out:
-            torch.cuda.current_stream().synchronize()
+            self._clock.mark()
             return frame
         self._out_pinned.copy_(frame)  # blocking D2H copy
         return self._out_np
