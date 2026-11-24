@@ -476,8 +476,9 @@ class WindowSource:
                     if self._stop:
                         return
                     if got is not None:
-                        frame, t_arrival, t_source = got
-                        yield Tick(frame, t_arrival, n, t_source=t_source, t_ready=time.perf_counter())
+                        frame, t_arrival, t_source, *rest = got
+                        yield Tick(frame, t_arrival, n, t_source=t_source, t_ready=time.perf_counter(),
+                                   ready_event=rest[0] if rest else None)
                         n, good = n + 1, good + 1
                         if good >= 30:  # working again (a capture opened anew hands over a frame before failing)
                             fails, failing, said = 0, None, ""

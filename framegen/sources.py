@@ -92,12 +92,14 @@ class TestMode:
         self.on = on
         self._n = 0  # frames seen while on
         self._last = None  # the last kept frame
+        self._last_event = None
         self._truth: dict = {}
         self._game: dict = {}  # the source's repeat hint for each recent frame: True new, False repeat, None unknown
 
     def set_on(self, on: bool) -> None:
         if on and not self.on:
             self._last = None  # don't repeat a frame from before it was switched on
+            self._last_event = None
             self._truth.clear()
             self._game.clear()
         self.on = on
@@ -119,12 +121,12 @@ class TestMode:
         self._game[i] = tick.extra["game_new"] = tick.extra.get("size_new", tick.new_hint)
         self._game.pop(i - self.KEEP, None)
         if i % 2 == 0:  # kept: arrives as new content
-            self._last = tick.frame
+            self._last, self._last_event = tick.frame, tick.ready_event
             tick.content, tick.truth_new, tick.new_hint = i, True, True
         elif self._last is not None:  # left out: the kept frame again, the real one kept as truth
             self._truth[i] = tick.frame
             self._truth.pop(i - self.KEEP, None)
-            tick.frame = self._last
+            tick.frame, tick.ready_event = self._last, self._last_event
             tick.content, tick.truth_new, tick.new_hint = i - 1, False, False
         else:  # switched on at an odd frame: nothing to repeat yet
             return None
@@ -204,7 +206,7 @@ class Clock60:
             yield Tick(latest.frame, latest.t_arrival if fresh else handed, index, latest.content,
                        latest.truth_new if fresh else None,
                        new_hint=latest.new_hint if fresh else False, damaged=latest.damaged and fresh,
-                       t_ready=handed, t_source=latest.t_source, extra=extra)
+                       t_ready=handed, t_source=latest.t_source, extra=extra, ready_event=latest.ready_event)
             index += 1
             if self._phase_lock and fresh and lag_ms < 0.25 * self.period * 1000.0:
                 age = handed - latest.t_arrival

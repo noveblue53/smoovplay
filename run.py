@@ -44,6 +44,11 @@ Settings (frame rate, upscaler, ...) are chosen in the window's menu (key M) and
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+_ROOT = str(Path(__file__).resolve().parent)
+if not sys.path or sys.path[0] != _ROOT:
+    sys.path.insert(0, _ROOT)
 
 if __name__ == "__main__" and "--list-sources" in sys.argv:  # answered before the heavy imports below
     from framegen.sources import main as list_sources
@@ -54,7 +59,6 @@ import gc
 import os
 import threading
 import time
-from pathlib import Path
 
 # torch's OpenMP threads wait for work asleep instead of spinning. Without CUDA (DirectML) the repeat checks run on the
 # CPU every frame, and threads spinning between them kept most of the CPU's cores busy for the whole session. Set
@@ -351,10 +355,16 @@ def main() -> int:
                     help="RTX VSR quality: 1 low ... 4 ultra (more GPU time per frame)")
     ap.add_argument("--fsr-sharpness", type=float, default=None, choices=BY_KEY["fsr_sharpness"].choices,
                     help="FSR 1 sharpening, in stops below maximum: 0 = sharpest, 1 = half, 2 = quarter")
+    ap.add_argument("--look", default=None, metavar="ID|off",
+                    help="turn a look on for this run (e.g. vivid, my:crisp) or 'off' to disable looks")
     ap.add_argument("--hz", type=int, default=None, choices=[60, 90, 120],
                     help="output rate for a 30 fps game: 120 = 3 generated frames per real one (half-res flow by "
                          "default), 90 = 2 (needs a VRR/G-Sync screen or a 90 Hz mode to look even). Needs --display; "
                          "falls back to 60 Hz output whenever it can't keep up")
+    ap.add_argument("--game-fps", default=None, choices=BY_KEY["game_fps"].choices,
+                    help="game's own frame rate: auto (read from the stream) or 30 (every other tick is new, so "
+                         "CBR/dark/still scenes never fool Even out 40-60 fps). Default: 30 for --source tap, else "
+                         "the saved setting")
     ap.add_argument("--display-cv", action="store_true", help="use the (slow) OpenCV window instead of OpenGL")
     ap.add_argument("--out", help="write output video")
     ap.add_argument("--score", action="store_true", help="[sim] PSNR of interpolated frames vs real dropped frames")
@@ -392,12 +402,24 @@ def main() -> int:
     test = TestMode(a.test_mode) if kind in ("chiaki", "capture", "tap") or (kind == "file" and a.raw) else None
     if a.test_mode and test is None:
         ap.error("--test-mode needs Remote Play, a capture card, the frame tap, or a video file with --raw")
+    webrtc_bridge = None
     if kind == "tap":
         from framegen.tap import DEFAULT_NAME, open_tap
+        from framegen.webrtc_tap import DEFAULT_PORT, WebRtcTapBridge
+        tap_name = a.tap or DEFAULT_NAME
+        if sys.platform == "win32":
+            try:
+                webrtc_bridge = WebRtcTapBridge(tap_name=tap_name, port=DEFAULT_PORT)
+                webrtc_bridge.start()
+                print(f"[webrtc-tap] listening on ws://127.0.0.1:{webrtc_bridge.port} -> {tap_name}")
+            except OSError:
+                webrtc_bridge = None  # another bridge is already listening on the port
         try:  # compressed frames come through the same reader as chiaki-ng's, so they count as "chiaki" from here
-            kind, src = open_tap(a.tap or DEFAULT_NAME, a.chiaki_decoder, wait_s=600, test=test,
+            kind, src = open_tap(tap_name, a.chiaki_decoder, wait_s=600, test=test,
                                  log_path=a.chiaki_log)
         except (ValueError, TimeoutError) as e:
+            if webrtc_bridge is not None:
+                webrtc_bridge.stop()
             print(f"[tap] {e}", file=sys.stderr)
             return 1
         if not src.info.test_mode:  # an app that sends only new pictures: no test mode (as for window capture)
@@ -446,9 +468,22 @@ def main() -> int:
                        ("interp", False if a.off else None), ("vsync", a.vsync), ("fullscreen", a.fullscreen),
                        ("minimize_chiaki", a.minimize_chiaki), ("simulate_30", True if a.test_mode else None),
                        ("steady_hud", a.steady_hud), ("vfg_quality", a.vfg_quality), ("present", a.present),
-                       ("hdr", a.hdr), ("fill", a.fill)):
+                       ("hdr", a.hdr), ("fill", a.fill), ("game_fps", a.game_fps)):
         if value is not None:
             settings.override(key, value)
+    if picked == "tap" and a.game_fps is None and settings.game_fps != "30":
+        settings.override("game_fps", "30")
+        print("[run] tap: locking game_fps=30 (override with --game-fps auto)")
+    if a.look is not None:
+        if a.look.lower() == "off":
+            settings.override("look_on", False)
+        else:
+            from framegen.looks import Library
+            Library()
+            if a.look not in BY_KEY["look"].choices:
+                ap.error(f"--look: unknown look {a.look!r} (available: {', '.join(BY_KEY['look'].choices)})")
+            settings.override("look", a.look)
+            settings.override("look_on", True)
     # --model: one of the settings' choices, or another RIFE version for testing (not something the menu offers)
     test_model = a.model if a.model is not None and a.model not in BY_KEY["model"].choices else None
     if a.model is not None and test_model is None:
@@ -611,10 +646,17 @@ def main() -> int:
     if a.out:
         choices["hz"] = (60,)
         unavailable["hz"] = "90/120 fps can't be recorded with --out yet."
+    tap_overlay = None
+    if webrtc_bridge is not None:
+        from framegen.webrtc_tap import find_webview_overlay
+        tap_overlay = find_webview_overlay()
+        if tap_overlay is not None:
+            print("[webrtc-tap] overlaying SmoovPlay over SmoovPlayXboxWebView (XboxWebView keeps controller focus)")
+    overlay_fn = src.where if kind == "window" else tap_overlay
     window = (WindowSink(src.w, src.h) if a.display_cv else
               GLWindowSink(src.w, src.h, settings, restart_reasons, choices, unavailable,
-                           overlay_of=src.where if kind == "window" else None, hdr=hdr10[0],
-                           window_keys=window_keys if kind == "window" else None,
+                           overlay_of=overlay_fn, hdr=hdr10[0],
+                           window_keys=window_keys if overlay_fn is not None else None,
                            hdr_peak=min(hdr_peak or 1e9, 1000.0),
                            clean_source=kind == "capture" and bool(getattr(src, "raw", False))) if a.display else None)
     if hdr10[0] and not getattr(window, "hdr10", False):  # the window couldn't present HDR10: shown in SDR
@@ -841,6 +883,8 @@ def main() -> int:
             replay.close(wait_saves=30)  # a clip being saved is finished first; before & after carries on alone
         sink.close()
         src.close()
+        if webrtc_bridge is not None:
+            webrtc_bridge.stop()
         stop_results.set()
         if results_thread.is_alive():
             results_thread.join(timeout=5)  # so the last write below isn't racing one already under way

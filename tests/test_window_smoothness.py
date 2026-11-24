@@ -238,3 +238,114 @@ def test_window_overlay_uses_dxgi_when_present_is_dxgi(monkeypatch):
         monkeypatch.setattr(w, "_open_dxgi", lambda *a, **kw: (opened.append((a, kw)), setattr(w, "dx", object())))
         w._choose_presentation(1920, 1080, hdr=False, hdr_peak=1000.0)
         assert len(opened) == 1 and w.dx is not None
+
+
+def test_async_cuda_event_handoff_propagates_through_clock60_and_pipeline(monkeypatch):
+    # 1. Clock60 preserves ready_event on both fresh and repeated beats
+    ev0, ev1 = object(), object()
+    clock_t = [0.0]
+
+    def fake_clock():
+        return clock_t[0]
+
+    def fake_sleep(dt):
+        clock_t[0] += dt
+
+    class _EventSource:
+        info = source_info("window")
+
+        def __init__(self):
+            self.gate = threading.Event()
+
+        def __iter__(self):
+            yield Tick(torch.zeros((8, 8, 3), dtype=torch.uint8), clock_t[0], 0, ready_event=ev0)
+            self.gate.wait(timeout=2.0)
+            yield Tick(torch.ones((8, 8, 3), dtype=torch.uint8), clock_t[0], 1, ready_event=ev1)
+
+        def close(self):
+            self.gate.set()
+
+    src = _EventSource()
+    c = Clock60(src, hz=60.0, clock=fake_clock, sleep=fake_sleep)
+    it = iter(c)
+    t0 = next(it)
+    t1 = next(it)  # repeat beat of first frame
+    src.gate.set()
+    # Wait briefly for reader thread to publish second frame
+    for _ in range(50):
+        t2 = next(it)
+        if t2.ready_event is ev1:
+            break
+        time.sleep(0.002)
+    c.close()
+    assert t0.ready_event is ev0 and t1.ready_event is ev0 and t2.ready_event is ev1
+
+    # 2. Pipeline calls current_stream().wait_event(tick.ready_event) before interp.load(tick.frame)
+    order = []
+
+    class _FakeStream:
+        def wait_event(self, ev):
+            order.append(("wait", ev))
+
+    class _RecordingInterp(_DummyInterp):
+        def load(self, frame):
+            order.append(("load", int(frame[0, 0, 0])))
+            super().load(frame)
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a, **kw: _FakeStream())
+
+    def event_ticks():
+        now = time.perf_counter()
+        yield Tick(torch.full((8, 8, 3), 7, dtype=torch.uint8), now, 0, new_hint=True, ready_event=ev0)
+        yield Tick(torch.full((8, 8, 3), 9, dtype=torch.uint8), now + TICK, 1, new_hint=False, ready_event=ev1)
+
+    _cpu_pipeline(_RecordingInterp()).run(event_ticks(), enabled=False, live=False)
+    assert order == [("wait", ev0), ("load", 7), ("wait", ev1), ("load", 9)]
+
+
+def test_async_cuda_event_handoff_real_gpu_stream():
+    if not torch.cuda.is_available():
+        return
+    producer = torch.cuda.Stream()
+    bgra = torch.empty((16, 16, 4), dtype=torch.uint8, device="cuda")
+    with torch.cuda.stream(producer):
+        bgra[..., 0].fill_(12)
+        bgra[..., 1].fill_(34)
+        bgra[..., 2].fill_(56)
+        bgra[..., 3].fill_(255)
+        frame = dda.to_bgr(bgra, 8, 8)
+        ready = torch.cuda.Event()
+        ready.record(producer)
+
+    loaded = []
+
+    class _GpuInterp(_DummyInterp):
+        device = "cuda"
+
+        def load(self, f):
+            loaded.append(f.clone())
+            self.in_u8 = f
+
+    def one_tick():
+        yield Tick(frame, time.perf_counter(), 0, new_hint=True, ready_event=ready)
+
+    _cpu_pipeline(_GpuInterp()).run(one_tick(), enabled=False, live=False)
+    torch.cuda.current_stream().synchronize()
+    assert len(loaded) == 1
+    assert loaded[0][0, 0].cpu().tolist() == [12, 34, 56]
+
+
+def test_dda_close_synchronizes_stream():
+    synced = []
+
+    class _FakeStream:
+        def synchronize(self):
+            synced.append(True)
+
+    cap = dda.DdaCapture.__new__(dda.DdaCapture)
+    cap._stream = _FakeStream()
+    cap._prev_bgra = None
+    cap.dup = cap.res = cap.texture = cap.context = cap.device = cap.output = cap.adapter = cap.factory = None
+    cap._held = False
+    cap.close()
+    assert synced == [True] and cap._stream is None

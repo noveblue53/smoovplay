@@ -175,8 +175,10 @@ class DdaCapture:
         return False
 
     def grab(self, timeout_ms: int = 100):
-        """(frame, t_acquired, t_present) when our part of the screen has changed, else None (no change within the
-        timeout, or a change elsewhere). Raises CaptureLost when Windows takes the duplication away."""
+        """(frame, t_acquired, t_present, ready) when our part of the screen has changed, else None (no change within
+        the timeout, or a change elsewhere). `ready` is a torch.cuda.Event recorded on `self._stream` after `to_bgr`,
+        so the consumer's CUDA stream can `wait_event(ready)` instead of blocking this thread on the CPU. Raises
+        CaptureLost when Windows takes the duplication away."""
         import time
 
         import torch
@@ -228,10 +230,11 @@ class DdaCapture:
             else:
                 self._prev_bgra.copy_(self.bgra)
             frame = to_bgr(self.bgra, self.out_w, self.out_h)
-        stream.synchronize()  # the frame is complete before another thread (the pipeline's) reads it
+            ready = torch.cuda.Event()
+            ready.record(stream)
         self.copies += 1
         t_present = info.LastPresentTime / self._qpf  # QueryPerformanceCounter, as time.perf_counter on Windows
-        return frame, t_acquired, (t_present if abs(t_present - t_acquired) < 1.0 else None)
+        return frame, t_acquired, (t_present if abs(t_present - t_acquired) < 1.0 else None), ready
 
     def _release_frame(self) -> None:
         if self._held:
@@ -239,8 +242,13 @@ class DdaCapture:
             _com(self.dup, DUP_RELEASE_FRAME, [])
 
     def close(self) -> None:
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            try:
+                stream.synchronize()
+            except Exception:  # noqa: BLE001 - closing
+                pass
         self._prev_bgra = None
-        self._stream = None
         if self.dup:
             self._release_frame()
         if self.res:

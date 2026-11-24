@@ -407,6 +407,8 @@ class Pipeline:
         next_due = 0.0
         cuts = CutDetector(self.cut_threshold)
         slot = 0
+        key_slot: int | None = None
+        prev_key_slot: int | None = None
         key_frame: np.ndarray | None = None  # last frame that arrived as new content
         key_content: int | None = None
         # Scoring: --score, or live while "Simulate a 30 fps game" is on (the source keeps the left-out frames).
@@ -544,14 +546,23 @@ class Pipeline:
                     st.simulated += 1
                 if settings.interp != enabled:
                     enabled, sched, quarter_due, ov_next = settings.interp, CadenceScheduler(), False, 0.0
+                    key_slot = prev_key_slot = None
                     print(f"[pipeline] interpolation {'ON' if enabled else 'OFF'}")
                 if settings.steady_hud != steady:
                     steady = settings.steady_hud
                     if hasattr(it, "set_steady"):
                         it.set_steady(STEADY_HUD_THRESHOLD if steady else 0.0)
                     print(f"[pipeline] steady HUD {'ON' if steady else 'OFF'}")
+            if hasattr(it, "rgb10a2_out"):
+                replay_on = bool(replay is not None and replay.length)
+                it.rgb10a2_out = bool(gpu_out and getattr(sink, "rgb10a2_vsr", False) and not replay_on)
             t0 = time.perf_counter()
             st.queue_ms.append((t0 - tick.t_arrival) * 1000)
+            if tick.ready_event is not None:
+                cur_stream = torch.cuda.current_stream()
+                cur_stream.wait_event(tick.ready_event)
+                if torch.is_tensor(tick.frame) and tick.frame.is_cuda:
+                    tick.frame.record_stream(cur_stream)
             if torch.is_tensor(tick.frame):  # already on the GPU (hardware decoder)
                 it.load(tick.frame)
             else:
@@ -713,11 +724,14 @@ class Pipeline:
                     else:
                         sched = CadenceScheduler()  # starts afresh, from the next new frame
                         action = sched.step(is_new, is_cut)
+                        key_slot = prev_key_slot = None
                         print("[pipeline] even timing off")
                 if is_new and not timed:
+                    prev_key_slot = key_slot
                     slot = 1 - slot
                     it.prepare(slot)  # (in_u8 holds this tick's frame)
                     in_slot[slot] = added.id
+                    key_slot = slot
                 if timed:
                     if dipping:
                         st.dip_ticks += 1
@@ -754,6 +768,8 @@ class Pipeline:
                 elif hz == 90 and action is Action.INTERP and show_early(1 / 3):
                     mid_t = 2 / 3
                 quarter_due = action is Action.INTERP
+                rgb10 = bool(getattr(it, "rgb10a2_out", False) and getattr(it, "encoding", None) == "rgb10a2"
+                             and not getattr(it, "hdr", False))
                 if timed:
                     pass  # shown above
                 elif action is Action.INTERP:
@@ -762,15 +778,17 @@ class Pipeline:
                     if gt_fn is not None and key_gpu is not None and mid_t == 0.5:
                         to_score = (key_frame, key_content)  # scored once the frame is on screen
                 elif action in (Action.PENDING, Action.HOLD):
-                    out = key_frame
+                    hold_slot = prev_key_slot if is_new else key_slot
+                    out = it.slots[hold_slot] if (rgb10 and hold_slot is not None) else key_frame
                 elif rhythm is not None and key_frame is not None:
                     # Game frame rate 30 fps, and the lock called this tick a repeat. After a game holds a frame for
                     # a third tick (it dipped below 30), the lock is a tick out of step until its vote moves, and this
                     # tick carries the game's next frame: shown now, the in-between frame before it would follow on
                     # the next tick, stepping back. The frame the lock last called new keeps the order, a tick late.
-                    out = key_frame
+                    hold_slot = prev_key_slot if is_new else key_slot
+                    out = it.slots[hold_slot] if (rgb10 and hold_slot is not None) else key_frame
                 else:
-                    out = tick.frame
+                    out = it.slots[key_slot] if (rgb10 and key_slot is not None) else tick.frame
             prev_key = key_gpu
             if is_new:
                 key_frame, key_content = tick.frame, tick.content
