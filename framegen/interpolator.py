@@ -9,6 +9,10 @@ Design notes
   `flownet(img0, img1, f0, f1) -> middle frame`. In a stream each real frame is
   the "next" frame of one pair and the "previous" frame of the following pair,
   so we encode it exactly once into one of two ping-pong slots.
+* At 90 and 120 Hz a real frame has two or three in-between frames. queue() asks for each on the interpolator's own
+  CUDA stream, into the next of QUEUE_DEPTH output buffers, so the GPU makes the next one while the pipeline waits to
+  show the one before. The timestep is written on that stream just before each frame's graph runs, so each queued
+  frame keeps its own: no graph per timestep or per buffer is needed.
 * Frames enter and leave as HxWx3 uint8 BGR (OpenCV / capture-card layout), or with hdr=True as HxWx3 float16 BGR
   PQ BT.2020 (framegen/hdr.py "pq16", settings "hdr" = HDR output). The model sees 0..1 either way.
 """
@@ -20,6 +24,7 @@ import math
 import subprocess
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -37,6 +42,8 @@ MODELS: dict[str, tuple[str, int]] = {
     "4.25": ("IFNet_HDv3_v4_25", 64),
     "4.26": ("IFNet_HDv3_v4_26", 64),
 }
+# Output buffers for queue(): at 120 Hz a new frame's tick asks for 1/4, 1/2 and the next tick's 3/4 at once.
+QUEUE_DEPTH = 3
 WEIGHTS_URL = "https://github.com/HolyWu/vs-rife/releases/download/model/flownet_v{version}.pkl"
 DEFAULT_MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 
@@ -54,6 +61,15 @@ def ensure_weights(version: str, model_dir: Path = DEFAULT_MODEL_DIR) -> Path:
             subprocess.run(["curl", "-sfL", "-o", str(tmp), url], check=True)
         tmp.replace(path)
     return path
+
+
+@dataclass
+class Queued:
+    """A frame queue() asked for: `frame` (one of the output buffers) holds it once `event` has passed (event None:
+    it's ready already, as on the CPU)."""
+    frame: torch.Tensor
+    event: object = None  # torch.cuda.Event
+    t: float = 0.5
 
 
 class RifeInterpolator:
@@ -129,6 +145,12 @@ class RifeInterpolator:
         self.inp = torch.zeros((height, width, 3), dtype=self.frame_dtype, device=dev)
         self.out_u8 = torch.zeros((height, width, 3), dtype=self.frame_dtype, device=dev)
         self.in_u8 = torch.zeros((height, width, 3), dtype=torch.uint8, device=dev) if hdr else self.inp
+        # queue()'s output buffers (each reused QUEUE_DEPTH frames later), the events that say each is ready, and its
+        # stream. The graphs still write out_u8; queue() copies that into its buffer on the same stream.
+        self.outs = [torch.zeros_like(self.out_u8) for _ in range(QUEUE_DEPTH)]
+        self._next_out = 0
+        self.stream = torch.cuda.Stream(dev) if dev.type == "cuda" else None
+        self._events = [torch.cuda.Event() for _ in self.outs] if self.stream is not None else []
         with torch.no_grad():
             fshape = self.encode(torch.zeros((1, 3, ph, pw), dtype=dt, device=dev)).shape
         self.fast = None if reference else FastIFNet(self.flownet, ph, pw, dt, dev)
@@ -203,6 +225,7 @@ class RifeInterpolator:
 
     def set_steady(self, threshold: float) -> None:
         """Steady HUD on (threshold: largest real-frame difference, 0..1, that counts as still) or off (0)."""
+        self._join()  # (the mask is read by frames still queued)
         if threshold > 0:
             self.hud.still_thr.fill_(threshold)
             if self.steady <= 0 and self._slot is not None:  # turned on mid-pair: the current pair's mask now
@@ -229,25 +252,16 @@ class RifeInterpolator:
             fn()
         return g
 
-    # ---- public API ----------------------------------------------------------
-    def prepare(self, slot: int) -> None:
-        """Convert+encode `in_u8` into ping-pong slot `slot` (0/1); with Steady HUD on, also where it acts between
-        the previous real frame and this one."""
-        if self.cuda_graph:
-            self._graphs[("prep", slot)].replay()
-            if self.steady > 0:
-                self._graphs[("mask", slot)].replay()
-        else:
-            self._prepare_eager(slot)
-            if self.steady > 0:
-                self._steady_mask(1 - slot, slot)
-        self._slot = slot
+    def _join(self) -> None:
+        """The current stream waits for the frames queued so far (on the GPU, not the CPU): they read the slots, the
+        Steady HUD mask and the timestep planes, and write out_u8."""
+        if self.stream is not None:
+            torch.cuda.current_stream(self.device).wait_stream(self.stream)
 
-    def interpolate(self, newest_slot: int, t: float = 0.5) -> torch.Tensor:
-        """Frame at fraction t (0.5 = midpoint) from slot (1-newest_slot) to newest_slot -> `out_u8`.
-        Each call overwrites `out_u8`, so for several timesteps copy each result out before the next."""
-        if t != self._t:  # the graphs read these static planes, so no recapture is needed
-            if self.trt is not None:
+    def _run(self, newest_slot: int, t: float) -> None:
+        """Frame at t into out_u8, on the current stream."""
+        if t != self._t:  # the graphs read these static planes, so no recapture is needed. Written on the stream
+            if self.trt is not None:  # the frame runs on, so frames queued before it keep their own t
                 self.trt.set_timestep(t)
             if self.fast is not None:
                 self.fast.set_timestep(t)
@@ -260,7 +274,50 @@ class RifeInterpolator:
             self._graphs[("interp", newest_slot, steady)].replay()
         else:
             self._interp_eager(1 - newest_slot, newest_slot, steady)
+
+    # ---- public API ----------------------------------------------------------
+    def prepare(self, slot: int) -> None:
+        """Convert+encode `in_u8` into ping-pong slot `slot` (0/1); with Steady HUD on, also where it acts between
+        the previous real frame and this one."""
+        self._join()  # (it overwrites the older frame's slot, which queued frames may still read)
+        if self.cuda_graph:
+            self._graphs[("prep", slot)].replay()
+            if self.steady > 0:
+                self._graphs[("mask", slot)].replay()
+        else:
+            self._prepare_eager(slot)
+            if self.steady > 0:
+                self._steady_mask(1 - slot, slot)
+        self._slot = slot
+
+    def interpolate(self, newest_slot: int, t: float = 0.5) -> torch.Tensor:
+        """Frame at fraction t (0.5 = midpoint) from slot (1-newest_slot) to newest_slot -> `out_u8`.
+        Each call overwrites `out_u8`, so for several timesteps copy each result out before the next, or use queue().
+        Runs on the current stream, after any frames queue() asked for."""
+        self._join()
+        self._run(newest_slot, t)
         return self.out_u8
+
+    def queue(self, newest_slot: int, t: float = 0.5) -> Queued:
+        """Ask for the frame at t, as interpolate() makes it, and return at once: it's made on the interpolator's own
+        stream after the frames asked for before it, into the next of QUEUE_DEPTH output buffers. Wait for its event,
+        not the whole stream, so the ones after it keep running while it's shown.
+
+        It starts after the work already on the current stream (this tick's load and prepare). Its buffer is reused
+        QUEUE_DEPTH calls later: by then the frame must have been taken (whatever reads it on the GPU put on the
+        current stream, or copied out)."""
+        k = self._next_out
+        self._next_out = (k + 1) % len(self.outs)
+        out = self.outs[k]
+        if self.stream is None:  # CPU: made here and now
+            out.copy_(self.interpolate(newest_slot, t))
+            return Queued(out, None, t)
+        self.stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(self.stream):
+            self._run(newest_slot, t)
+            out.copy_(self.out_u8)
+            self._events[k].record(self.stream)
+        return Queued(out, self._events[k], t)
 
     def load(self, frame_u8: torch.Tensor) -> None:
         """Copy an HxWx3 frame (GPU or pinned CPU; uint8, or float16 if hdr) into the static input."""

@@ -106,8 +106,8 @@ class EvalPipeline(Pipeline):
         self.frames = self.copies = 0
         self._a0 = self._a0_content = None
 
-    def _score(self, st, tick, a, prev, prev_content, gt_fn, keep_worst=True) -> None:
-        super()._score(st, tick, a, prev, prev_content, gt_fn, keep_worst=False)
+    def _score(self, st, tick, a, prev, prev_content, gt_fn, keep_worst=True, out=None) -> None:
+        super()._score(st, tick, a, prev, prev_content, gt_fn, keep_worst=False, out=out)
         if prev_content is None or tick.content is None or tick.content - prev_content != 2:
             return
         gt_np = gt_fn(prev_content + 1)
@@ -115,7 +115,8 @@ class EvalPipeline(Pipeline):
             return
         dev = self.interp.device
         gt = torch.from_numpy(gt_np).to(dev).float()
-        A, B, mid = a.float(), self.interp.in_u8.float(), self.interp.out_u8.float()
+        A, B = a.float(), self.interp.in_u8.float()
+        mid = (self.interp.out_u8 if out is None else out).float()  # (out: the queued frame shown)
         a0 = self._a0 if self._a0_content == prev_content - 2 else None
         self._a0, self._a0_content = A, prev_content
         if (gt - A).abs().mean().item() < 0.5 and (B - gt).abs().mean().item() >= 0.5:

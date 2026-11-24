@@ -2,7 +2,9 @@
 
 Speed: per real frame, encode it once and generate t = 1/4, 1/2, 3/4 (each copied to the CPU, as the
 pipeline would), on real video frames. The budget at 120 Hz is 33.3 ms per real frame, minus four
-screen updates.
+screen updates. "queued" asks for all three at once (RifeInterpolator.queue, as the pipeline does) and
+copies each out once its own event has passed, so the GPU makes the next while one is copied; "first"
+is when the 1/4 frame is on the CPU, which queueing must not make later.
 
 Quality, without a 120 fps recording: from a 60 fps clip keep every 4th frame (a 15 fps "game"),
 generate the 3 frames in between and score them against the real ones. That is the same job as
@@ -80,8 +82,9 @@ def main() -> int:
             it.prepare(slot)
 
         # ---- speed: per real frame, 1 midpoint (60 Hz output) vs 3 in-betweens (120 Hz), downloads included
-        for name, ts in (("1 frame (60 Hz)", (0.5,)), ("3 frames (120 Hz)", TS)):
-            times = []
+        for name, ts, queued in (("1 frame (60 Hz)", (0.5,), False), ("3 frames (120 Hz)", TS, False),
+                                 ("3 queued (120 Hz)", TS, True)):
+            times, firsts = [], []
             for k, g in enumerate(groups(a.videos[0], a.start, 1e9)):
                 if k == 0:
                     load(g[0], 0)
@@ -89,13 +92,23 @@ def main() -> int:
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
                 load(g[4], slot)
-                for t in ts:
-                    out_pinned.copy_(it.interpolate(slot, t))  # blocking copy to the CPU, as the pipeline does
+                if queued:
+                    for q in [it.queue(slot, t) for t in ts]:
+                        q.event.synchronize()  # this frame only
+                        out_pinned.copy_(q.frame)
+                        if q.t == ts[0]:
+                            firsts.append((time.perf_counter() - t0) * 1000)
+                else:
+                    for t in ts:
+                        out_pinned.copy_(it.interpolate(slot, t))  # blocking copy to the CPU, as the pipeline does
+                        if t == ts[0]:
+                            firsts.append((time.perf_counter() - t0) * 1000)
                 times.append((time.perf_counter() - t0) * 1000)
                 if len(times) == a.speed_frames + 5:
                     break
-            x = np.array(times[5:])
-            print(f"scale {scale}: {name:<18} per real frame  p50 {np.median(x):5.1f} ms  p95 {np.percentile(x, 95):5.1f} ms")
+            x, f = np.array(times[5:]), np.array(firsts[5:])
+            print(f"scale {scale}: {name:<18} per real frame  p50 {np.median(x):5.1f} ms  p95 {np.percentile(x, 95):5.1f} ms"
+                  f"   first p50 {np.median(f):5.1f} ms")
 
         # ---- quality
         for video in a.videos:

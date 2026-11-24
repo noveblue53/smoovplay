@@ -412,6 +412,10 @@ class Pipeline:
            90: the new frame's tick shows 1/3 then 2/3; its repeat tick shows B.
         When the pipeline is running behind, a tick skips the extra frame(s) and shows what 60 Hz would (the 1/2
         frame, or B), so it never builds a backlog.
+        A tick's in-between frames are asked for together, right after prepare (_order), and each is waited for only
+        when its turn to be shown comes (_take): with RifeInterpolator.queue the GPU makes the next one while the
+        frame pacer waits to show the one before. At 120 Hz a new frame's tick also asks for the 3/4 frame its repeat
+        tick shows.
         """
         if settings is not None:
             enabled, hz = settings.interp, settings.hz if sink is not None else 60
@@ -420,6 +424,7 @@ class Pipeline:
         steady = None  # Steady HUD as last applied to the interpolator (followed live from settings)
         self.stats = st
         quarter_due = False  # 120 Hz: the previous tick interpolated, so this repeat tick owes the 3/4 frame
+        owed = None  # 120 Hz: that 3/4 frame, asked for by the previous tick (_order), or None
         behind_ms = 1000 * TICK * 0.6  # start-of-tick lag above which the extra frames are skipped
         gap = 0.95 / hz  # time between two presents, 5% short so the schedule has slack to catch up
         next_due = 0.0
@@ -654,6 +659,9 @@ class Pipeline:
             shown = []  # (CPU time, a real frame's arrival, TickClock mark) for real_delay_ms, once the GPU is done
             early_cmd = None  # 90/120 Hz: the first of this tick's two frames, already shown
             mid_t = 0.5  # the generated frame this tick ends on
+            final = None  # ...as asked for (_order), and once made, its tensor (for --score)
+            mid_frame = None
+            ahead, owed = owed, None  # the 3/4 frame the previous tick asked for: this tick's only
             # Behind = waiting frames, not decode time: a Remote Play frame's arrival is before its ~3-11 ms decode.
             t_avail = tick.t_arrival if tick.t_ready is None else tick.t_ready
             behind = (t0 - t_avail) * 1000 >= behind_ms
@@ -676,12 +684,13 @@ class Pipeline:
                     replay.frame(frame, t_now)  # after it's on screen, so it adds no delay
                 return cmd
 
-            def show_early(t: float) -> bool:
+            def show_early(job) -> bool:
+                """An extra 90/120 Hz frame as asked for (_order), or None: skipped, as the pipeline is behind."""
                 nonlocal early_cmd
-                if not extra_ok:
+                if job is None:
                     st.quarter_skipped += 1
                     return False
-                early_cmd = present(self._generated(it.interpolate(slot, t), gpu_out), ov_text)
+                early_cmd = present(self._take(job, gpu_out), ov_text)
                 st.quarter_shown += 1
                 return True
 
@@ -744,13 +753,24 @@ class Pipeline:
                         phases = phases[-1:]
                     else:
                         st.quarter_shown += len(phases) - 1
-                    for k, phi in enumerate(phases):
-                        pl = timeline.place(phi)
+                    # Asked for together too (see the docstring), up to the first that needs another real frame put in:
+                    # that one waits for the frames asked for before it, so it's asked for when its turn comes.
+                    places = [timeline.place(phi) for phi in phases]
+                    jobs = {}
+                    for k, pl in enumerate(places):
+                        if pl.b is not None:
+                            if jobs and not self._pair_in(pl.a, pl.b, slot, in_slot):
+                                break
+                            slot = self._timed_pair(pl.a, pl.b, slot, in_slot)
+                            jobs[k] = self._order(slot, pl.t)
+                    for k, pl in enumerate(places):
                         if pl.b is None:
                             frame = pl.a.frame
                         else:
-                            slot = self._timed_pair(pl.a, pl.b, slot, in_slot)
-                            frame = self._generated(it.interpolate(slot, pl.t), gpu_out)
+                            if k not in jobs:
+                                slot = self._timed_pair(pl.a, pl.b, slot, in_slot)
+                                jobs[k] = self._order(slot, pl.t)
+                            frame = self._take(jobs[k], gpu_out)
                         st.uneven_waits += pl.waiting
                         if k < len(phases) - 1:
                             early_cmd = present(frame, ov_text) or early_cmd
@@ -759,17 +779,25 @@ class Pipeline:
                         else:
                             out, reached = frame, pl.reached
                             action = Action.INTERP if pl.b is not None else Action.CURRENT
-                elif hz == 120 and action is Action.INTERP:
-                    show_early(0.25)
+                elif hz in (90, 120) and action is Action.INTERP:
+                    # Asked for in the order they're shown, before the first is waited for (see the docstring).
+                    first = self._order(slot, 0.25 if hz == 120 else 1 / 3) if extra_ok else None
+                    if hz == 90 and first is not None:
+                        mid_t = 2 / 3
+                    final = self._order(slot, mid_t)
+                    if hz == 120 and first is not None:  # (when behind, the repeat tick asks, if it isn't then)
+                        owed = self._order(slot, 0.75)
+                    show_early(first)
                 elif hz == 120 and quarter_due and action is Action.CURRENT and not is_new:
-                    show_early(0.75)
-                elif hz == 90 and action is Action.INTERP and show_early(1 / 3):
-                    mid_t = 2 / 3
+                    show_early(None if not extra_ok else ahead if ahead is not None else self._order(slot, 0.75))
                 quarter_due = action is Action.INTERP
                 if timed:
                     pass  # shown above
                 elif action is Action.INTERP:
-                    out = self._generated(it.interpolate(slot, mid_t), gpu_out)
+                    if final is None:
+                        final = self._order(slot, mid_t)
+                    out = self._take(final, gpu_out)
+                    mid_frame = getattr(final, "frame", None)  # (None: interpolate()'s out_u8, see _score)
                     # --score has ground truth only at the midpoint
                     if gt_fn is not None and key_gpu is not None and mid_t == 0.5:
                         to_score = (key_frame, key_content)  # scored once the frame is on screen
@@ -853,7 +881,7 @@ class Pipeline:
                 replay.real_frame(tick.frame, tick.t_arrival)
 
             if to_score is not None:
-                self._score(st, tick, prev_key, *to_score, gt_fn, keep_worst=score)
+                self._score(st, tick, prev_key, *to_score, gt_fn, keep_worst=score, out=mid_frame)
                 st.score_ms.append((time.perf_counter() - t_shown) * 1000)
 
             if sink is not None:
@@ -916,6 +944,37 @@ class Pipeline:
         in_slot[slot] = b.id
         return slot
 
+    def _pair_in(self, a, b, slot: int, in_slot: list) -> bool:
+        """Even timing: whether frames a then b are in the interpolator's slots already (_timed_pair puts nothing in)."""
+        return in_slot[slot] == b.id and in_slot[1 - slot] == a.id
+
+    def _order(self, slot: int, t: float):
+        """Ask for the in-between frame at t from slot (1-slot) to slot. With RifeInterpolator.queue it starts on the
+        GPU now, behind the ones asked for before it; otherwise it's made when taken (_take). At most QUEUE_DEPTH
+        frames may wait to be taken at a time, and only until the next prepare; one not taken is just dropped."""
+        queue = getattr(self.interp, "queue", None)
+        return queue(slot, t) if queue is not None else (slot, t)
+
+    def _take(self, job, gpu_out: bool):
+        """A frame _order asked for, ready for the sink."""
+        if isinstance(job, tuple):
+            return self._generated(self.interp.interpolate(*job), gpu_out)
+        return self._queued(job, gpu_out)
+
+    def _queued(self, job, gpu_out: bool):
+        """A queued frame (interpolator.Queued) for the sink. On the GPU the current stream waits on its event
+        (no CPU wait: the frames queued after it keep running on the interpolator's stream while this one is shown)
+        and TickClock marks when it's done; on the CPU its event is waited for before the blocking download."""
+        if gpu_out:
+            if job.event is not None:
+                torch.cuda.current_stream(self.interp.device).wait_event(job.event)
+            self._clock.mark()
+            return job.frame
+        if job.event is not None:
+            job.event.synchronize()
+        self._out_pinned.copy_(job.frame)  # blocking D2H copy
+        return self._out_np
+
     def _generated(self, frame: torch.Tensor, gpu_out: bool):
         """A generated frame for the sink. On the GPU it isn't waited for: everything that reads it (the CUDA-GL copy,
         RTX VSR, Looks in clips, instant replay) is queued on the same stream after it, and a CUDA event marks when
@@ -926,9 +985,12 @@ class Pipeline:
         self._out_pinned.copy_(frame)  # blocking D2H copy
         return self._out_np
 
-    def _score(self, st: Stats, tick, a: torch.Tensor, prev, prev_content, gt_fn, keep_worst: bool = True) -> None:
+    def _score(self, st: Stats, tick, a: torch.Tensor, prev, prev_content, gt_fn, keep_worst: bool = True,
+               out: torch.Tensor | None = None) -> None:
         """a: the previous real frame on the GPU (prev is the same frame on the CPU, kept for --save-worst).
-        keep_worst: copy the worst frame's images to the CPU (--save-worst); test mode skips that hitch."""
+        keep_worst: copy the worst frame's images to the CPU (--save-worst); test mode skips that hitch.
+        out: the AI frame shown (a queued frame's buffer); default the interpolator's out_u8."""
+        made = self.interp.out_u8 if out is None else out
         if prev_content is None or tick.content is None or tick.content - prev_content != 2:
             return  # only score clean 2-tick steps, where the in-between source frame exists
         gt_np = gt_fn(prev_content + 1)
@@ -937,7 +999,7 @@ class Pipeline:
         # In 8-bit levels: HDR frames (float16) through hdr.level8, so thresholds and dB read as for SDR ones.
         gt = level8(gt_np if torch.is_tensor(gt_np) else torch.from_numpy(gt_np).to(self.interp.device))
         b = self.interp.in_u8
-        out = level8(self.interp.out_u8)
+        out = level8(made)
         blend = ((a.float() + b.float()) * 0.5).round_()
         still = ((b.float() - a.float()).abs().amax(-1, keepdim=True) <= STILL_LEVELS).float()
         n_still = still.sum().clamp_min(1.0) * 3
@@ -964,4 +1026,4 @@ class Pipeline:
             st.hud_off.append((off.float() * hud).sum().item() / n_hud)
             st.hud_frac.append(n_hud / hud.numel())
         if keep_worst and (st.worst is None or p < st.worst[0]):
-            st.worst = (p, tick.index, _np(prev), _np(self.interp.out_u8), _np(gt_np), _np(tick.frame))
+            st.worst = (p, tick.index, _np(prev), _np(made), _np(gt_np), _np(tick.frame))

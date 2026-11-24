@@ -301,6 +301,25 @@ check.
 reference) that cut 1080p interpolation from about 16 ms to about 9 ms: one warp per direction instead of two,
 inputs downsampled before concatenation, fp32 copies made once per frame, NHWC convolutions. All per-frame GPU
 work is captured as CUDA graphs, and TensorRT engines are built once per resolution.
+
+At 90 and 120 Hz a tick asks for all its in-between frames at once, right after the new frame is encoded
+(`RifeInterpolator.queue`): they run one after another on the interpolator's own CUDA stream, each into one of three
+output buffers, with its timestep written on that stream just before it. Before each frame is shown the pipeline
+waits for that frame's CUDA event only, so the GPU makes the 1/2 frame while the frame pacer waits to show the 1/4
+one. A 120 Hz tick also asks for the 3/4 frame, which its repeat tick then shows ready-made. Even out 40-60 fps and
+Dip smoothing queue their frames the same way, up to the first one that needs another real frame put in.
+
+To compare before and after on the RTX PC, run each on the commit before the change (`git checkout e6aa6ef`) and
+on this one, with the same clip and settings:
+
+- `scripts/bench_120.py testdata\clip_1080p60.mp4 --scales 1.0 0.5`: the "3 queued (120 Hz)" row against "3 frames
+  (120 Hz)". Per real frame it should be no slower, and "first" (the 1/4 frame on the CPU) no later.
+- `run.py testdata\clip_1080p60.mp4 --realtime --display --hz 120` (and `--hz 90`, and with `--trt`): the summary at
+  the end. "extra in-between frames (90/120 Hz) shown" should go up, or stay at 100%; "real frame
+  arrival->presented" should go down, by up to one in-between frame's time at 120 Hz. "processing, interp ticks"
+  is the new frame's tick, from upload to its last frame ready, pacer sleeps included, so it can go down too.
+- `scripts/presentmon_check.ps1 -Hz 120` (and `-Hz 90`), then `scripts/presentmon_summary.py out\presentmon`: the
+  time between frames on screen should be as even as before, or more even.
 </details>
 
 <details>
