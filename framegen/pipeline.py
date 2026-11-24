@@ -405,6 +405,7 @@ class Pipeline:
         behind_ms = 1000 * TICK * 0.6  # start-of-tick lag above which the extra frames are skipped
         gap = 0.97 / hz  # time between two presents, slight slack so the schedule can catch up
         next_due = 0.0
+        prev_was_interp = False  # 60 Hz live pacer only evens out the repeat tick right after an INTERP tick
         cuts = CutDetector(self.cut_threshold)
         slot = 0
         key_slot: int | None = None
@@ -531,6 +532,7 @@ class Pipeline:
                 want_hz = settings.hz if sink is not None else 60
                 if want_hz != hz:
                     hz, gap, quarter_due, ov_next, next_due = want_hz, 0.97 / want_hz, False, 0.0, 0.0
+                    prev_was_interp = False
                     st.hz_used.add(hz)
                     if replay is not None and hasattr(replay, "set_output_hz"):
                         replay.set_output_hz(hz)
@@ -650,11 +652,14 @@ class Pipeline:
             st.behind += behind
             extra_ok = hz > 60 and sink is not None and not behind
 
-            def present(frame, text: str):
+            def present(frame, text: str, pace_60: bool = False):
                 # Frame pacer: each present is due one gap after the previous one was *due*, so sleep overshoot and
                 # present time don't accumulate; when late it goes straight away and the schedule restarts from now.
                 # Locked to the display (VSync on a refresh rate that fits, framegen/display_sync.py) the sink waits
                 # for the display's refresh instead: a timer as well would fight it.
+                # At 60 Hz live, only pace the fast repeat tick immediately following a slower INTERP tick: real frames
+                # in 60 fps passthrough (or with framegen off, or after jitter spikes) present immediately without
+                # holding back behind a latched next_due deadline.
                 nonlocal next_due, pace_wait_s
                 if getattr(sink, "paced_by_display", False):
                     next_due = 0.0  # (picked up afresh if the display stops pacing)
@@ -667,7 +672,7 @@ class Pipeline:
                     next_due = max(next_due, now) + gap
                 elif is_live:
                     now = time.perf_counter()
-                    if next_due > 0.0:
+                    if pace_60 and next_due > 0.0:
                         target = min(next_due, t_avail + 0.88 * TICK)
                         if target > now:
                             woke = sleep_until(target)
@@ -834,7 +839,9 @@ class Pipeline:
                             if hasattr(sink, "toast"):
                                 sink.toast(advice, 8.0)
                     ov_text, ov_next = overlay_text(), t_ready + 0.25
-                cmd = present(out, ov_text) or early_cmd
+                pace_60 = prev_was_interp and action is not Action.INTERP and (timed or not is_new)
+                cmd = present(out, ov_text, pace_60=pace_60) or early_cmd
+            prev_was_interp = enabled and action is Action.INTERP
             t_shown = time.perf_counter()
             st.busy_ms.append(max(0.0, (t_shown - t0 - pace_wait_s) * 1000))
             if sink is not None:
