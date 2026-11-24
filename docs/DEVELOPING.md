@@ -97,6 +97,26 @@ Other tools: `scripts/benchmark.py` (GPU timing per model and resolution), `scri
 and quality), `scripts/check_fast.py` (checks the optimised forward pass against the reference), `scripts/latency_video.py`
 (delay from a slow-motion phone video) and `pytest tests`.
 
+**Timing without waiting for the GPU.** With the GL window's CUDA-GL interop, generated frames are not waited for
+before they're drawn: the copy into the GL texture, RTX VSR, Looks in clips and instant replay all read them on
+PyTorch's current stream, after the frame in the stream's order. CUDA events time each tick instead
+(`framegen/gputime.py`, TickClock), read a tick or two later, so "processing", "display/encode", busy time, the
+delay and the Remote Play CSV's processing column still include the GPU's time. At most two ticks of GPU work
+wait to be read; a third waits for the oldest. To compare a change here on the RTX PC, before and after, on the
+same clip and settings:
+
+- **The pipeline's stats** at the end of a session (`run.py ... --display`, 60, 90 and 120 Hz, with RTX VSR and
+  with a look on): processing per interp tick (it should stay about the same: it is GPU time either way),
+  display/encode (it should go down: drawing now overlaps RIFE), busy ticks over 16.7 ms, the extra frames shown at
+  90/120 fps (they should go up when the PC was close to the limit), and the delay (the same or lower).
+- **`scripts/presentmon_check.ps1`**, then `scripts/presentmon_summary.py out\presentmon`: the time between presents
+  and its spread (MsBetweenPresents) and the display delay, in each mode. GL with vsync off is where the GPU could
+  queue the most; DXGI's SetMaximumFrameLatency(1) and TickClock's limit both hold it back.
+- **`scripts/bench_120.py`** gives the GPU time of the 1/4, 1/2 and 3/4 frames alone: processing at 120 Hz should be
+  close to it, not more.
+- Look at the picture too: RTX VSR, a look with Looks in clips (save a clip with R), instant replay's before & after
+  (B) and NVIDIA VFG. A frame read too early shows up as a torn or mixed frame.
+
 <details>
 <summary><b>Settings, the in-video menu and hotkeys</b></summary>
 
