@@ -300,3 +300,66 @@ def test_webrtc_tap_bridge_logs_stats(capsys):
         sock.close()
         bridge.stop()
 
+
+def test_keyframe_skips_probe_when_param_sets_unchanged(monkeypatch):
+    from framegen import webrtc_tap
+
+    begins = []
+    pushes = []
+
+    class _DummyTap:
+        def begin(self, codec, width, height, max_fps=60, features=0):
+            begins.append((width, height))
+
+        def push(self, payload, frames_lost=0, recovered=False):
+            pushes.append(payload)
+
+        def end(self):
+            pass
+
+        def close(self):
+            pass
+
+        def take_idr_request(self):
+            return False
+
+        def audio_delay_ms(self):
+            return 0
+
+    probe_calls = []
+
+    def fake_probe(codec, payload):
+        probe_calls.append(payload)
+        return (2560, 1440) if b"\x67\x42\x00\x33" in payload else (1920, 1080)
+
+    monkeypatch.setattr(webrtc_tap, "_probe_resolution", fake_probe)
+
+    bridge = WebRtcTapBridge(port=0, tap=_DummyTap())
+    port = bridge.start()
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+    try:
+        _client_handshake(sock)
+        mask = b"\x05\x06\x07\x08"
+        sock.sendall(ws_encode_frame(
+            0x1,
+            json.dumps({"type": "start", "codec": "h264", "width": 1920, "height": 1080, "fps": 60, "probe": True}).encode(),
+            mask=mask,
+        ))
+        kf_1080_a = b"\x00\x00\x00\x01\x67\x42\x00\x28\x00\x00\x00\x01\x68\xce\x00\x00\x00\x01\x65\x11"
+        kf_1080_b = b"\x00\x00\x00\x01\x67\x42\x00\x28\x00\x00\x00\x01\x68\xce\x00\x00\x00\x01\x65\x22"
+        kf_1440 = b"\x00\x00\x00\x01\x67\x42\x00\x33\x00\x00\x00\x01\x68\xce\x00\x00\x00\x01\x65\x33"
+        for idx, payload in enumerate((kf_1080_a, kf_1080_b, kf_1440)):
+            sock.sendall(ws_encode_frame(0x2, _FRAME_HDR.pack(FLAG_KEYFRAME, 90000 + idx * 1500, 0) + payload, mask=mask))
+
+        deadline = time.perf_counter() + 2.0
+        while len(pushes) < 3 and time.perf_counter() < deadline:
+            time.sleep(0.01)
+
+        assert len(pushes) == 3
+        assert len(probe_calls) == 2  # kf_1080_a probed, kf_1080_b skipped, kf_1440 probed
+        assert begins == [(1920, 1080), (2560, 1440)]
+    finally:
+        sock.close()
+        bridge.stop()
+
+

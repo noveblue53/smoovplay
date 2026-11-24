@@ -45,7 +45,7 @@ import time
 
 import numpy as np
 
-from .chiaki_tap import FEATURE_AUDIO_DELAY, FrameTap
+from .chiaki_tap import FEATURE_AUDIO_DELAY, FrameTap, param_sets
 from .tap import DEFAULT_NAME
 
 DEFAULT_HOST = "127.0.0.1"
@@ -356,6 +356,7 @@ class WebRtcTapBridge:
         width, height, fps, feats = 1920, 1080, 60, 0
         prev_rtp: int | None = None
         last_audio_delay = -1
+        last_ps = b""
 
         def begin_stream(w: int, h: int) -> None:
             nonlocal started, width, height, prev_rtp, last_audio_delay
@@ -406,6 +407,7 @@ class WebRtcTapBridge:
                         h = max(16, int(ctrl.get("height", 1080)))
                         fps = max(1, min(240, int(ctrl.get("fps", 60))))
                         feats = FEATURE_AUDIO_DELAY if ctrl.get("audio_sync") else 0
+                        last_ps = b""
                         if ctrl.get("probe", False):
                             pending_start = {"width": w, "height": h}
                         else:
@@ -418,6 +420,7 @@ class WebRtcTapBridge:
                             print(f"[webrtc-tap] webrtc: {line}")
                     elif kind == "stop":
                         pending_start = None
+                        last_ps = b""
                         if started:
                             self.tap.end()
                             started, self.active, prev_rtp = False, False, None
@@ -432,6 +435,7 @@ class WebRtcTapBridge:
                     is_key = bool(flags & FLAG_KEYFRAME)
                     if not started:
                         if is_key:
+                            ps = param_sets(payload, "hevc" if codec in (1, 2) else "h264")
                             probed = _probe_resolution(codec, payload)
                             if probed is not None:
                                 begin_stream(*probed)
@@ -439,14 +443,20 @@ class WebRtcTapBridge:
                                 begin_stream(pending_start["width"], pending_start["height"])
                             else:
                                 begin_stream(1920, 1080)
+                            if ps:
+                                last_ps = ps
                             pending_start = None
                         else:
                             continue  # wait for the first keyframe so resolution & NVDEC start cleanly
                     elif is_key:
-                        probed = _probe_resolution(codec, payload)
-                        if probed is not None and probed != (width, height):
-                            print(f"[webrtc-tap] resolution changed: {width}x{height} -> {probed[0]}x{probed[1]}")
-                            begin_stream(*probed)
+                        # Avoid CPU-decoding every keyframe: only re-probe when SPS/PPS actually changes.
+                        ps = param_sets(payload, "hevc" if codec in (1, 2) else "h264")
+                        if ps and ps != last_ps:
+                            last_ps = ps
+                            probed = _probe_resolution(codec, payload)
+                            if probed is not None and probed != (width, height):
+                                print(f"[webrtc-tap] resolution changed: {width}x{height} -> {probed[0]}x{probed[1]}")
+                                begin_stream(*probed)
                     if lost == 0:
                         lost = infer_lost_frames(prev_rtp, rtp, fps)
                     if rtp:

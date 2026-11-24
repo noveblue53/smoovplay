@@ -134,7 +134,7 @@ public sealed class XboxWindow : Window
                 "SmoovPlay", "XboxWebView");
             // Keep WebRTC & gamepad active when this window is minimised or behind SmoovPlay.
             var opts = new CoreWebView2EnvironmentOptions(
-                "--disable-background-timer-throttling --disable-renderer-backgrounding --autoplay-policy=no-user-gesture-required");
+                "--disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows --autoplay-policy=no-user-gesture-required");
             var env = await CoreWebView2Environment.CreateAsync(null, dataDir, opts);
             await _web.EnsureCoreWebView2Async(env);
             _web.CoreWebView2.IsMuted = false;

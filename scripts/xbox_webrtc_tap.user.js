@@ -382,7 +382,7 @@
   function sendRawFrame(payload, timestamp, flags) {
     if (!wsOpen || payload.byteLength === 0) return;
     // Drop frames if the local socket is somehow backed up rather than adding latency.
-    if (ws.bufferedAmount > 2 * 1024 * 1024) return;
+    if (ws.bufferedAmount > 256 * 1024) return;
     ensureStarted();
     const out = new Uint8Array(12 + payload.byteLength);
     const view = new DataView(out.buffer);
