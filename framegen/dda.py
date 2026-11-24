@@ -70,6 +70,12 @@ def _overlaps(r: _Rect, x: int, y: int, w: int, h: int) -> bool:
     return r.left < x + w and r.right > x and r.top < y + h and r.bottom > y
 
 
+def is_unchanged(cur, prev) -> bool:
+    """True when `cur` and `prev` tensors are bit-identical (e.g. our own overlay triggered a DWM wake)."""
+    import torch
+    return prev is not None and bool(torch.equal(cur, prev))
+
+
 class DdaCapture:
     """The part (x, y, w, h) of output `output` of DXGI adapter 0 (window.plan_grab's Grab), as HxWx3 uint8 BGR CUDA
     tensors of out_w x out_h. Use it from one thread; close() it when done (a monitor allows only a few)."""
@@ -80,7 +86,9 @@ class DdaCapture:
         self.x, self.y, self.w, self.h, self.out_w, self.out_h = x, y, w, h, out_w, out_h
         self.factory = self.adapter = self.output = self.device = self.context = self.dup = None
         self.texture, self.res, self._held = None, c_void_p(), False
-        self.copies = self.skipped = 0  # frames copied; screen changes elsewhere on the monitor, skipped
+        self.copies = self.skipped = self.unchanged = 0  # copied; elsewhere on monitor; bit-identical desktop wakes
+        self._prev_bgra = None
+        self._stream = None
         freq = ctypes.c_longlong()
         ctypes.windll.kernel32.QueryPerformanceFrequency(byref(freq))
         self._qpf = float(freq.value)
@@ -98,6 +106,7 @@ class DdaCapture:
             rt.cudaMemcpy2DFromArrayAsync.argtypes = [p, s, p, s, s, s, s, c_int, p]
             rt.cudaGraphicsUnregisterResource.argtypes = [p]
             torch.cuda.current_device()  # the runtime initialised, PyTorch's context current on this thread
+            self._stream = torch.cuda.Stream()  # dedicated non-blocking stream: never serializes with RIFE graphs
             self._open(output)
         except Exception:
             self.close()
@@ -198,7 +207,7 @@ class DdaCapture:
                 _release(tex)
         finally:
             _release(resource)
-        stream = torch.cuda.current_stream()
+        stream = self._stream if self._stream is not None else torch.cuda.current_stream()
         s = c_void_p(stream.cuda_stream)
         res = byref(self.res)
         _cuda(self.rt.cudaGraphicsMapResources(1, res, s), "map")  # waits for the copy above
@@ -210,7 +219,15 @@ class DdaCapture:
         finally:
             _cuda(self.rt.cudaGraphicsUnmapResources(1, res, s), "unmap")
         self._release_frame()  # Windows can reuse its picture now: ours is copied
-        frame = to_bgr(self.bgra, self.out_w, self.out_h)
+        with torch.cuda.stream(stream):
+            if is_unchanged(self.bgra, self._prev_bgra):
+                self.unchanged += 1
+                return None
+            if self._prev_bgra is None:
+                self._prev_bgra = self.bgra.clone()
+            else:
+                self._prev_bgra.copy_(self.bgra)
+            frame = to_bgr(self.bgra, self.out_w, self.out_h)
         stream.synchronize()  # the frame is complete before another thread (the pipeline's) reads it
         self.copies += 1
         t_present = info.LastPresentTime / self._qpf  # QueryPerformanceCounter, as time.perf_counter on Windows
@@ -222,6 +239,8 @@ class DdaCapture:
             _com(self.dup, DUP_RELEASE_FRAME, [])
 
     def close(self) -> None:
+        self._prev_bgra = None
+        self._stream = None
         if self.dup:
             self._release_frame()
         if self.res:

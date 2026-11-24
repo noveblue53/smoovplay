@@ -16,6 +16,7 @@ from typing import NamedTuple
 import cv2
 import numpy as np
 
+from . import display_sync
 from .fill import Panorama, layout, panorama_t, visible, wider
 
 TICK = 1.0 / 60.0
@@ -526,14 +527,15 @@ class GLWindowSink:
         self._choose_presentation(w, h, hdr, hdr_peak)
         if self.dx is None:
             if overlay_of is not None:  # borderless, on top, click-through, and not focused when it opens
-                for hint, value in ((glfw.DECORATED, glfw.FALSE), (glfw.FLOATING, glfw.TRUE),
-                                    (glfw.FOCUSED, glfw.FALSE), (glfw.FOCUS_ON_SHOW, glfw.FALSE),
-                                    (glfw.MOUSE_PASSTHROUGH, glfw.TRUE)):
-                    glfw.window_hint(hint, value)
+                self._apply_overlay_hints(glfw)
             self.win = self.glwin = glfw.create_window(min(w, 1600), min(h, 900), "SmoovPlay", None, None)
             glfw.default_window_hints()
             glfw.make_context_current(self.win)
-        glfw.swap_interval(1 if st.vsync else 0)
+        # How frames meet the display's refreshes (framegen/display_sync.py), followed live by _update_sync().
+        self.sync = display_sync.plan(60.0, 60, True, False)
+        self._sync_key, self._refresh_hz, self._refresh_next, self._sync_noted = None, 60.0, 0.0, set()
+        self._note_pending = ""  # shown once the toast before it (the keys, at first) has gone
+        self._update_sync(force=True)
         # Fullscreen stays up when another window takes the focus (a click on a second display, a notification), as
         # borderless fullscreen does in games. GLFW's default minimises it, which with DXGI could also stall Present.
         glfw.set_window_attrib(self.win, glfw.AUTO_ICONIFY, glfw.FALSE)
@@ -811,13 +813,19 @@ class GLWindowSink:
                 return  # (it said why; Low delay would fail the same way)
         if st.present != "dxgi":
             return  # the standard presentation
-        if self.overlay_of is not None:
-            print("[display] window capture: standard presentation (the overlay draws with OpenGL)")
-        elif not st.fullscreen or FULLSCREEN_STYLE != "none":
+        if self.overlay_of is not None or not st.fullscreen or FULLSCREEN_STYLE != "none":
             self._open_dxgi(w, h)
         else:
             print("[display] fullscreen: standard presentation (Low delay is for windowed play; fullscreen already "
                   "skips the compositor)")
+
+    @staticmethod
+    def _apply_overlay_hints(glfw) -> None:
+        """Window hints for click-through, non-activating overlays."""
+        for hint, value in ((glfw.DECORATED, glfw.FALSE), (glfw.FLOATING, glfw.TRUE),
+                            (glfw.FOCUSED, glfw.FALSE), (glfw.FOCUS_ON_SHOW, glfw.FALSE),
+                            (glfw.MOUSE_PASSTHROUGH, glfw.TRUE)):
+            glfw.window_hint(hint, value)
 
     def note_presentation(self) -> None:
         """The "present" row can't be changed while Windows' HDR keeps the window on DXGI (it overrides HDR output's
@@ -841,6 +849,8 @@ class GLWindowSink:
             if not glwin:
                 raise RuntimeError("couldn't open an OpenGL context")
             glfw.window_hint(glfw.CLIENT_API, glfw.NO_API)
+            if self.overlay_of is not None:
+                self._apply_overlay_hints(glfw)
             win = glfw.create_window(min(w, 1600), min(h, 900), "SmoovPlay", None, None)
             glfw.default_window_hints()
             if not win:
@@ -883,12 +893,68 @@ class GLWindowSink:
         on DXGI only because Windows' HDR is on (KEEP_HDR): with the standard presentation it never tore."""
         return not self.keep_hdr or self._borderless or self.settings.present == "dxgi"
 
+    last_wait_s = 0.0  # the last frame's wait for the display (DXGI's waitable object): pacing, not work
+
+    @property
+    def paced_by_display(self) -> bool:
+        """The display's refreshes space the frames (the pipeline's pacer then doesn't sleep to a timer): VSync on, a
+        refresh rate that fits the output rate, and DXGI's frame latency waitable object to wait on."""
+        return self.dx is not None and bool(self.dx.waitable) and self.sync.display_paces
+
+    def _update_sync(self, force: bool = False) -> None:
+        """Follows the display's refresh rate (read every 2 s: the window can move to another monitor) and the
+        settings, and re-plans how frames meet the refreshes when either changed."""
+        now = time.perf_counter()
+        if force or now >= self._refresh_next:
+            self._refresh_next = now + 2.0
+            self._refresh_hz = self._read_refresh() or self._refresh_hz
+        st = self.settings
+        key = (self._refresh_hz, int(getattr(st, "hz", 60)), bool(st.vsync), bool(getattr(st, "vrr", False)))
+        if key == self._sync_key and not force:
+            return
+        changed = key != self._sync_key
+        self._sync_key = key
+        self.sync = display_sync.plan(*key)
+        if self.dx is not None:
+            self.dx.refresh_hz = self._refresh_hz
+        else:
+            self.glfw.swap_interval(self.sync.interval)
+        if changed:
+            how = self.sync.describe(key[0], key[1])
+            if self.sync.mode == "locked" and self.dx is not None and not self.dx.waitable:
+                how += " (no waitable swap chain: Present waits instead)"
+            elif self.sync.mode == "vrr" and self.dx is None and not st.fullscreen:
+                how += " (in a window this needs Window presentation: Low delay)"
+            print(f"[display] {how}")
+            if self.sync.note and self.sync.note not in self._sync_noted:
+                self._sync_noted.add(self.sync.note)
+                print(f"[display] {self.sync.note}")
+                self._note_pending = self.sync.note
+
+    def _read_refresh(self) -> float:
+        """The refresh rate of the monitor the window is (mostly) on, in Hz; 0 if Windows won't say."""
+        try:
+            from .dxgi_present import hwnd_value
+            from .window import monitor_of
+            return float(monitor_of(hwnd_value(self.glfw.get_win32_window(self.win)))[2])
+        except Exception:  # noqa: BLE001 - not Windows, or no window yet: keep the last
+            return 0.0
+
     def _present(self) -> None:
+        self.last_wait_s = 0.0
+        self._update_sync()
+        if self._note_pending and time.perf_counter() >= self._toast_until:
+            self.toast(self._note_pending, 8.0)
+            self._note_pending = ""
         if self.dx is not None:
             if self.glfw.get_window_attrib(self.win, self.glfw.ICONIFIED):
                 return  # minimised: nothing to show, and a flip-model Present can wait for a window nobody sees
             t0 = time.perf_counter()
-            self.dx.present(self.settings.vsync, tear=self._may_tear())
+            self.dx.wait()  # (never more than 100 ms) the display's refresh paces this when the sync interval is set
+            self.last_wait_s = time.perf_counter() - t0
+            _say_if_slow("DXGI frame wait", t0)
+            t0 = time.perf_counter()
+            self.dx.present(self.sync.interval, tear=self.sync.tear and self._may_tear())
             _say_if_slow("DXGI Present", t0)
         else:
             self.glfw.swap_buffers(self.win)
@@ -928,7 +994,7 @@ class GLWindowSink:
                            + ("" if st.fill == "fit" else "\nThe same 16:9 picture: consoles send 16:9 only"), 3.0)
             return
         elif key == "fullscreen":
-            if self.dx is not None and st.fullscreen and self.fs_style == "none":
+            if self.dx is not None and st.fullscreen and self.fs_style == "none" and self.overlay_of is None:
                 self.toast("Fullscreen starts next time you press Play: Low delay works in a window only", 5.0)
                 return
             self._set_fullscreen(st.fullscreen)
@@ -937,8 +1003,8 @@ class GLWindowSink:
                 self.toast("Windows' HDR is on now: fullscreen switches the display to SDR until you press Play again",
                            6.0)
                 return
-        elif key == "vsync":
-            glfw.swap_interval(1 if st.vsync else 0)
+        elif key in ("vsync", "vrr"):
+            self._update_sync(force=True)
         elif key in ("look", "look_on"):
             if not self.menu.open:
                 self.toast(f"Look: {self.looks.name() if st.look_on else 'Off'}")
@@ -1052,7 +1118,8 @@ class GLWindowSink:
             mode = glfw.get_video_mode(mon)
             glfw.set_window_monitor(win, mon, 0, 0, mode.size.width, mode.size.height, mode.refresh_rate)
         _say_if_slow("fullscreen " + ("on" if on else "off"), t0)
-        glfw.swap_interval(1 if self.settings.vsync else 0)
+        self._refresh_next = 0.0  # (it may be on another monitor, or another mode)
+        self._update_sync(force=True)
 
     def _set_borderless(self, on: bool) -> None:
         """Fullscreen as a borderless window over the monitor, as games' borderless mode (the standard presentation's
@@ -1507,6 +1574,8 @@ class GLWindowSink:
         if self.interop is not None:
             self.interop.close()
         if self.dx is not None:
+            if seen := self.dx.times.summary():  # what the display did, not what was sent (GetFrameStatistics)
+                print(f"[display] on screen ({self.sync.describe(*self._sync_key[:2])}): {seen}")
             self.dx.close()
             self.glfw.destroy_window(self.glwin)
         self.glfw.destroy_window(self.win)
@@ -1584,6 +1653,14 @@ class MultiSink:
         for s in self.sinks:
             cmd = s.write(frame, text) or cmd
         return cmd
+
+    @property
+    def paced_by_display(self) -> bool:
+        return any(getattr(s, "paced_by_display", False) for s in self.sinks)
+
+    @property
+    def last_wait_s(self) -> float:
+        return sum(getattr(s, "last_wait_s", 0.0) for s in self.sinks)
 
     def wait(self, w: Waiting) -> str | None:
         cmd = None

@@ -14,6 +14,7 @@ from .cadence import Action, CadenceScheduler, CutDetector, DipWatch, DuplicateD
 from .hdr import level8, to_u8
 from .interpolator import STEADY_HUD_THRESHOLD, RifeInterpolator
 from .io import TICK, MiniText, Waiting
+from .winutil import sleep_until
 
 
 # --score's "still areas": pixels within this many levels (of 255) in both real frames, like a HUD or map.
@@ -375,7 +376,8 @@ class Pipeline:
         self.waiting = None  # the source's Waiting while no frame is coming, else None (the watchdog reads it too)
 
     def run(self, source, sink=None, enabled: bool = True, score: bool = False, label: str = "",
-            on_tick=None, hz: int = 60, settings=None, gt=None, remote=None, replay=None) -> Stats:
+            on_tick=None, hz: int = 60, settings=None, gt=None, remote=None, replay=None,
+            live: bool | None = None) -> Stats:
         """on_tick(tick, diff, action, proc_ms, t_start), if given, is called after each tick is processed.
         remote: the source, when it can press a button for the delay test (L: PS5 Remote Play's chiaki-ng,
         framegen.chiaki_tap.ChiakiSource) or hold its sound back to meet the picture (settings.audio_sync: chiaki-ng,
@@ -395,12 +397,13 @@ class Pipeline:
         """
         if settings is not None:
             enabled, hz = settings.interp, settings.hz if sink is not None else 60
+        is_live = bool(getattr(getattr(source, "info", None), "live", False)) if live is None else bool(live)
         it, sched, st = self.interp, CadenceScheduler(), Stats(private=bool(getattr(self.interp, "private", False)))
         steady = None  # Steady HUD as last applied to the interpolator (followed live from settings)
         self.stats = st
         quarter_due = False  # 120 Hz: the previous tick interpolated, so this repeat tick owes the 3/4 frame
         behind_ms = 1000 * TICK * 0.6  # start-of-tick lag above which the extra frames are skipped
-        gap = 0.95 / hz  # time between two presents, 5% short so the schedule has slack to catch up
+        gap = 0.97 / hz  # time between two presents, slight slack so the schedule can catch up
         next_due = 0.0
         cuts = CutDetector(self.cut_threshold)
         slot = 0
@@ -525,7 +528,7 @@ class Pipeline:
             if settings is not None:  # changed in the menu (or by a hotkey) since the last tick?
                 want_hz = settings.hz if sink is not None else 60
                 if want_hz != hz:
-                    hz, gap, quarter_due, ov_next = want_hz, 0.95 / want_hz, False, 0.0
+                    hz, gap, quarter_due, ov_next, next_due = want_hz, 0.97 / want_hz, False, 0.0, 0.0
                     st.hz_used.add(hz)
                     if replay is not None and hasattr(replay, "set_output_hz"):
                         replay.set_output_hz(hz)
@@ -628,22 +631,42 @@ class Pipeline:
             to_score = None
             early_cmd = None  # 90/120 Hz: the first of this tick's two frames, already shown
             mid_t = 0.5  # the generated frame this tick ends on
+            pace_wait_s = 0.0
             # Behind = waiting frames, not decode time: a Remote Play frame's arrival is before its ~3-11 ms decode.
             t_avail = tick.t_arrival if tick.t_ready is None else tick.t_ready
-            behind = (t0 - t_avail) * 1000 >= behind_ms
+            lag_ms = max((t0 - t_avail) * 1000, float(tick.extra.get("clock_lag_ms", 0.0)))
+            behind = lag_ms >= behind_ms
             st.behind += behind
             extra_ok = hz > 60 and sink is not None and not behind
 
             def present(frame, text: str):
                 # Frame pacer: each present is due one gap after the previous one was *due*, so sleep overshoot and
                 # present time don't accumulate; when late it goes straight away and the schedule restarts from now.
-                nonlocal next_due
-                if hz > 60:
+                # Locked to the display (VSync on a refresh rate that fits, framegen/display_sync.py) the sink waits
+                # for the display's refresh instead: a timer as well would fight it.
+                nonlocal next_due, pace_wait_s
+                if getattr(sink, "paced_by_display", False):
+                    next_due = 0.0  # (picked up afresh if the display stops pacing)
+                elif hz > 60:
                     now = time.perf_counter()
                     if next_due > now:
-                        time.sleep(next_due - now)
+                        woke = sleep_until(next_due)
+                        pace_wait_s += woke - now
+                        now = woke
                     next_due = max(next_due, now) + gap
+                elif is_live:
+                    now = time.perf_counter()
+                    if next_due > 0.0:
+                        target = min(next_due, t_avail + 0.88 * TICK)
+                        if target > now:
+                            woke = sleep_until(target)
+                            pace_wait_s += woke - now
+                            now = woke
+                        next_due = (now if now - target > TICK else max(target, now)) + TICK
+                    else:
+                        next_due = now + TICK
                 cmd = sink.write(frame, text)
+                pace_wait_s += getattr(sink, "last_wait_s", 0.0)  # waiting for the display's refresh isn't work
                 t_now = time.perf_counter()
                 shown_rate.add(t_now)
                 if replay is not None:
@@ -795,9 +818,9 @@ class Pipeline:
                     ov_text, ov_next = overlay_text(), t_ready + 0.25
                 cmd = present(out, ov_text) or early_cmd
             t_shown = time.perf_counter()
-            st.busy_ms.append((t_shown - t0) * 1000)
+            st.busy_ms.append(max(0.0, (t_shown - t0 - pace_wait_s) * 1000))
             if sink is not None:
-                st.sink_ms.append((t_shown - t_ready) * 1000)
+                st.sink_ms.append(max(0.0, (t_shown - t_ready - pace_wait_s) * 1000))
 
             # Track when each real frame first reaches the screen (timed: when the game time shown reaches it).
             if timed:

@@ -590,8 +590,6 @@ def main() -> int:
     if test is None:
         unavailable["simulate_30"] = ("Not with window capture yet." if kind == "window" else
                                       "Video files already play as a 30 fps game.")
-    if kind == "window":
-        unavailable["present"] = "Window capture draws its picture over the app's with the standard presentation."
     if kind != "chiaki":
         unavailable["hdr"] = "Only used with PS5 Remote Play."
     elif dml_mode:
@@ -778,9 +776,10 @@ def main() -> int:
 
     ticks = iter(src)  # one stream for every session, so a restart doesn't reconnect or reopen anything
     if sink.sinks:  # playing on screen: keep frames on time when other programs are busy
-        from framegen.winutil import boost_gpu, boost_thread, keep_screen_on
+        from framegen.winutil import boost_gpu, boost_thread, high_res_timer, keep_screen_on
         print(f"[run] scheduling: MMCSS {'on' if boost_thread() else 'off'}, "
               f"GPU priority {'high' if boost_gpu() else 'normal'}, "
+              f"1ms timer {'on' if high_res_timer(True) else 'off'}, "
               f"screen kept on {'yes' if keep_screen_on() else 'no'}")  # (a controller isn't input to Windows)
     try:
         while True:
@@ -796,7 +795,7 @@ def main() -> int:
                              on_tick=getattr(src, "log_tick", None), settings=settings,
                              gt=test.gt if test is not None else getattr(src, "gt", None),
                              remote=src if kind in ("chiaki", "capture") and hasattr(src, "can_press") else None,
-                             replay=replay)
+                             replay=replay, live=bool(src.info.live))
             live[:] = [None, None]  # first, so a report written meanwhile never counts this session twice
             if a.results:
                 done.append((cfg, stats))
@@ -830,8 +829,9 @@ def main() -> int:
             if hasattr(s, "hide"):
                 s.hide()
         if sink.sinks:  # the screen can turn off again, while clips finish saving
-            from framegen.winutil import keep_screen_on
+            from framegen.winutil import high_res_timer, keep_screen_on
             keep_screen_on(False)
+            high_res_timer(False)
         if kind == "chiaki" and hasattr(src, "set_audio_delay"):
             src.set_audio_delay(0)  # chiaki-ng's sound back on time (it would also lapse once we stop)
         if hidden:

@@ -424,6 +424,7 @@ class WindowSource:
         self.w, self.h = size or (plan.region.w, plan.region.h)
         self.info = source_info("window", name=f"{target.app} window", hz=float(hz))
         self.restarts = 0
+        self.unchanged = 0
         self._stop = False
         self._container = None
         self.path = "GPU" if self._open_gpu else "CPU"
@@ -546,6 +547,7 @@ class WindowSource:
     def _close_container(self) -> None:
         c, self._container = self._container, None
         if c is not None:
+            self.unchanged += int(getattr(c, "unchanged", 0))
             try:
                 c.close()
             except Exception:  # noqa: BLE001 - closing
@@ -556,7 +558,8 @@ class WindowSource:
         isn't safe); Clock60's reader is a daemon thread, so a capture still waiting for the screen to change doesn't
         hold up the exit."""
         self._stop = True
-        print(f"[window] capture restarted {self.restarts} time(s) for moves; frames came through the {self.path}")
+        skipped = f" ({self.unchanged} unchanged desktop captures skipped)" if self.unchanged else ""
+        print(f"[window] capture restarted {self.restarts} time(s) for moves; frames came through the {self.path}{skipped}")
 
 
 def _open_lavfi(spec: str):

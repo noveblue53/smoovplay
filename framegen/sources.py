@@ -152,9 +152,11 @@ class Clock60:
     `overtaken`.
     """
 
-    def __init__(self, source, hz: float = 60.0, clock=time.perf_counter, sleep=time.sleep) -> None:
+    def __init__(self, source, hz: float = 60.0, clock=time.perf_counter, sleep=time.sleep,
+                 phase_lock: bool = True) -> None:
         self.source, self.period = source, 1.0 / hz
         self._clock, self._sleep = clock, sleep
+        self._phase_lock = phase_lock
         self._cond = threading.Condition()
         self._latest = None
         self._serial = 0  # frames received so far
@@ -182,11 +184,12 @@ class Clock60:
 
     def __iter__(self):
         from .io import Tick
+        from .winutil import sleep_until
         self._taken = 0  # the serial of the frame handed on last
         threading.Thread(target=self._reader, name="clock60", daemon=True).start()
         with self._cond:  # the first beat is the first frame
             self._cond.wait_for(lambda: self._latest is not None or self._done)
-        beat, index = self._clock(), 0
+        beat, index, lag_ms = self._clock(), 0, 0.0
         while True:
             with self._cond:
                 latest, serial, done = self._latest, self._serial, self._done
@@ -195,17 +198,29 @@ class Clock60:
             if latest is None or (done and not fresh):
                 return
             handed = self._clock()  # the beat, or a moment after it if the sleep overshot
+            extra = dict(latest.extra) if fresh else {}
+            if lag_ms > 0.0:
+                extra["clock_lag_ms"] = lag_ms
             yield Tick(latest.frame, latest.t_arrival if fresh else handed, index, latest.content,
                        latest.truth_new if fresh else None,
                        new_hint=latest.new_hint if fresh else False, damaged=latest.damaged and fresh,
-                       t_ready=handed, t_source=latest.t_source, extra=dict(latest.extra) if fresh else {})
+                       t_ready=handed, t_source=latest.t_source, extra=extra)
             index += 1
+            if self._phase_lock and fresh and lag_ms < 0.25 * self.period * 1000.0:
+                age = handed - latest.t_arrival
+                if 0.0 <= age < self.period:
+                    err = age - 0.35 * self.period
+                    adjust = max(-0.05 * self.period, min(0.05 * self.period, 0.08 * err))
+                    beat -= adjust
             beat += self.period
             now = self._clock()
-            if beat < now - self.period:  # fell a whole beat behind (the pipeline stalled): restart the beat from now
-                beat = now
-            elif beat > now:
-                self._sleep(beat - now)
+            if beat < now:
+                lag_ms = (now - beat) * 1000.0
+                if beat < now - self.period:  # fell a whole beat behind (the pipeline stalled): restart the beat
+                    beat = now
+            else:
+                lag_ms = 0.0
+                sleep_until(beat, clock=self._clock, sleep=self._sleep)
 
 
 # ----------------------------------------------------------------------------- repeat detector
