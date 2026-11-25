@@ -208,20 +208,17 @@ func Run(ctx context.Context, client *gssv.Client, cfg Config) error {
 		}
 	})
 
-	// Input channel: 125 Hz XInput polling + rumble feedback + FEATURE_PRESS delay test
+	// Input channel: 250 Hz XInput polling (immediate on change, 125 Hz idle heartbeat) + rumble feedback + FEATURE_PRESS delay test
+	rumble := newRumbleController(input.SetRumble)
+	defer rumble.stopAll()
+
 	dcInput.OnOpen(func() {
-		log.Printf("[xbox-tap] input channel open (125 Hz XInput polling)")
+		log.Printf("[xbox-tap] input channel open (250 Hz XInput polling)")
 		go runInputLoop(runCtx, dcInput, dcControl, tap)
 	})
 	dcInput.OnMessage(func(msg webrtc.DataChannelMessage) {
 		if vib, ok := input.ParseVibration(msg.Data); ok {
-			input.SetRumble(vib.GamepadIndex, vib.LeftMotor, vib.RightMotor)
-			if vib.DurationMs > 0 {
-				go func(idx uint8, d time.Duration) {
-					time.Sleep(d)
-					input.SetRumble(idx, 0, 0)
-				}(vib.GamepadIndex, time.Duration(vib.DurationMs)*time.Millisecond)
-			}
+			rumble.apply(vib)
 		}
 	})
 
@@ -385,7 +382,7 @@ func Run(ctx context.Context, client *gssv.Client, cfg Config) error {
 
 	// Background loop: SmoovPlay IDR backchannel, audio delay sync, GSSV keepalive, live stats
 	go func() {
-		backTick := time.NewTicker(50 * time.Millisecond)
+		backTick := time.NewTicker(4 * time.Millisecond)
 		keepTick := time.NewTicker(30 * time.Second)
 		defer backTick.Stop()
 		defer keepTick.Stop()
@@ -493,6 +490,154 @@ func (s *syntheticPress) step(now time.Time) (uint16, bool) {
 	return s.buttons, false
 }
 
+const (
+	inputPollInterval      = 4 * time.Millisecond // 250 Hz XInput + TakePressRequest polling
+	inputHeartbeatInterval = 8 * time.Millisecond // 125 Hz idle heartbeat
+)
+
+// rumbleController serializes rumble updates per gamepad and ensures any new
+// vibration packet cancels/supersedes a pending zeroing timer for that controller.
+type rumbleController struct {
+	mu     sync.Mutex
+	setFn  func(index uint8, left, right float32)
+	timers map[uint8]*time.Timer
+	gen    map[uint8]uint64
+	closed bool
+}
+
+func newRumbleController(setFn func(index uint8, left, right float32)) *rumbleController {
+	return &rumbleController{
+		setFn:  setFn,
+		timers: make(map[uint8]*time.Timer),
+		gen:    make(map[uint8]uint64),
+	}
+}
+
+func (r *rumbleController) apply(vib input.VibrationReport) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	idx := vib.GamepadIndex
+	r.gen[idx]++
+	gen := r.gen[idx]
+	if t, ok := r.timers[idx]; ok {
+		t.Stop()
+		delete(r.timers, idx)
+	}
+	r.setFn(idx, vib.LeftMotor, vib.RightMotor)
+	if vib.DurationMs > 0 {
+		d := time.Duration(vib.DurationMs) * time.Millisecond
+		r.timers[idx] = time.AfterFunc(d, func() {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if r.closed || r.gen[idx] != gen {
+				return
+			}
+			delete(r.timers, idx)
+			r.setFn(idx, 0, 0)
+		})
+	}
+}
+
+func (r *rumbleController) stopAll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closed = true
+	for idx, t := range r.timers {
+		t.Stop()
+		delete(r.timers, idx)
+		r.setFn(idx, 0, 0)
+	}
+}
+
+// inputDispatcher polls gamepads and synthetic press requests, dispatching a packet
+// immediately on any controller state change and maintaining a 125 Hz heartbeat when idle.
+type inputDispatcher struct {
+	start        time.Time
+	seq          uint32
+	wasConnected [4]bool
+	synth        syntheticPress
+	lastSent     []input.GamepadState
+	lastSentAt   time.Time
+
+	pollGamepad      func(index uint8) input.GamepadState
+	takePressRequest func() (buttons uint32, holdMs uint32)
+	onPressSent      func()
+	onGamepadChanged func(index int, connected bool)
+	sendPacket       func(pkt []byte) error
+}
+
+func (d *inputDispatcher) step(now time.Time) bool {
+	notifyPressSent := false
+	if d.takePressRequest != nil {
+		if chiakiBtns, holdMs := d.takePressRequest(); chiakiBtns != 0 {
+			xboxBtns := input.MapChiakiButtons(chiakiBtns)
+			if d.synth.trigger(now, xboxBtns, holdMs) {
+				notifyPressSent = true
+			}
+		}
+	}
+	synthBtns, synthReleased := d.synth.step(now)
+
+	var active []input.GamepadState
+	for i := uint8(0); i < 4; i++ {
+		st := d.pollGamepad(i)
+		if i == 0 && (synthBtns != 0 || synthReleased) {
+			// Ensure virtual gamepad 0 stays attached during a synthetic press/release.
+			if !st.Connected {
+				st.Connected = true
+			}
+			st.Buttons |= synthBtns
+		}
+		if st.Connected != d.wasConnected[i] {
+			d.wasConnected[i] = st.Connected
+			if d.onGamepadChanged != nil {
+				d.onGamepadChanged(int(i), st.Connected)
+			}
+		}
+		if st.Connected {
+			active = append(active, st)
+		}
+	}
+	if len(active) == 0 {
+		d.lastSent = nil
+		return false
+	}
+
+	changed := !gamepadStatesEqual(active, d.lastSent)
+	heartbeatDue := d.lastSentAt.IsZero() || now.Sub(d.lastSentAt) >= inputHeartbeatInterval
+	if !changed && !notifyPressSent && !synthReleased && !heartbeatDue {
+		return false
+	}
+
+	tsMs := float64(now.Sub(d.start).Milliseconds())
+	pkt := input.EncodeGamepadPacket(d.seq, tsMs, active)
+	d.seq++
+	if err := d.sendPacket(pkt); err == nil {
+		d.lastSent = append(d.lastSent[:0], active...)
+		d.lastSentAt = now
+		if notifyPressSent && d.onPressSent != nil {
+			d.onPressSent()
+		}
+		return true
+	}
+	return false
+}
+
+func gamepadStatesEqual(a, b []input.GamepadState) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func runInputLoop(ctx context.Context, dcInput, dcControl *webrtc.DataChannel, tap *frametap.Writer) {
 	start := time.Now()
 	var seq uint32 = 1
@@ -500,11 +645,27 @@ func runInputLoop(ctx context.Context, dcInput, dcControl *webrtc.DataChannel, t
 	_ = dcInput.Send(input.EncodeClientMetadata(seq, 0, 1))
 	seq++
 
-	ticker := time.NewTicker(8 * time.Millisecond) // 125 Hz
+	ticker := time.NewTicker(inputPollInterval) // 250 Hz
 	defer ticker.Stop()
 
-	wasConnected := [4]bool{true, false, false, false}
-	var synth syntheticPress
+	disp := &inputDispatcher{
+		start:        start,
+		seq:          seq,
+		wasConnected: [4]bool{true, false, false, false},
+		pollGamepad:  input.PollGamepad,
+		onGamepadChanged: func(index int, connected bool) {
+			sendControlJSON(dcControl, map[string]any{
+				"message":      "gamepadChanged",
+				"gamepadIndex": index,
+				"wasAdded":     connected,
+			})
+		},
+		sendPacket: dcInput.Send,
+	}
+	if tap != nil {
+		disp.takePressRequest = tap.TakePressRequest
+		disp.onPressSent = tap.PressSent
+	}
 
 	for {
 		select {
@@ -514,48 +675,7 @@ func runInputLoop(ctx context.Context, dcInput, dcControl *webrtc.DataChannel, t
 			if dcInput.ReadyState() != webrtc.DataChannelStateOpen {
 				continue
 			}
-
-			notifyPressSent := false
-			if tap != nil {
-				if chiakiBtns, holdMs := tap.TakePressRequest(); chiakiBtns != 0 {
-					xboxBtns := input.MapChiakiButtons(chiakiBtns)
-					if synth.trigger(now, xboxBtns, holdMs) {
-						notifyPressSent = true
-					}
-				}
-			}
-			synthBtns, synthReleased := synth.step(now)
-
-			var active []input.GamepadState
-			for i := uint8(0); i < 4; i++ {
-				st := input.PollGamepad(i)
-				if i == 0 && (synthBtns != 0 || synthReleased) {
-					// Ensure virtual gamepad 0 stays attached during a synthetic press/release.
-					if !st.Connected {
-						st.Connected = true
-					}
-					st.Buttons |= synthBtns
-				}
-				if st.Connected != wasConnected[i] {
-					wasConnected[i] = st.Connected
-					sendControlJSON(dcControl, map[string]any{
-						"message":      "gamepadChanged",
-						"gamepadIndex": int(i),
-						"wasAdded":     st.Connected,
-					})
-				}
-				if st.Connected {
-					active = append(active, st)
-				}
-			}
-			if len(active) > 0 {
-				tsMs := float64(time.Since(start).Milliseconds())
-				pkt := input.EncodeGamepadPacket(seq, tsMs, active)
-				seq++
-				if err := dcInput.Send(pkt); err == nil && notifyPressSent && tap != nil {
-					tap.PressSent()
-				}
-			}
+			disp.step(now)
 		}
 	}
 }

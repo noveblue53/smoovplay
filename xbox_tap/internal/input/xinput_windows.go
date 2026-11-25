@@ -48,12 +48,15 @@ type xinputVibration struct {
 
 var (
 	xinputDLL      *syscall.LazyDLL
-	procGetStateEx *syscall.LazyProc
+	addrGetStateEx uintptr
 	procGetState   *syscall.LazyProc
 	procSetState   *syscall.LazyProc
 )
 
 func init() {
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	procGetProcAddress := kernel32.NewProc("GetProcAddress")
+
 	for _, name := range []string{"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"} {
 		dll := syscall.NewLazyDLL(name)
 		if err := dll.Load(); err == nil {
@@ -61,9 +64,13 @@ func init() {
 			procGetState = dll.NewProc("XInputGetState")
 			procSetState = dll.NewProc("XInputSetState")
 			// Ordinal 100 is XInputGetStateEx which also reports the Xbox Guide button (0x0400).
+			// Win32 GetProcAddress resolves ordinals when passed as an integer uintptr(100)
+			// (MAKEINTRESOURCEA(100)), not as a Go string.
 			if h, err2 := syscall.LoadLibrary(name); err2 == nil {
-				if addr, err3 := syscall.GetProcAddress(h, string(rune(100))); err3 == nil && addr != 0 {
-					_ = addr
+				if addr, _, _ := procGetProcAddress.Call(uintptr(h), uintptr(100)); addr != 0 {
+					addrGetStateEx = addr
+				} else {
+					_ = syscall.FreeLibrary(h)
 				}
 			}
 			break
@@ -73,11 +80,16 @@ func init() {
 
 // PollGamepad reads controller `index` (0..3) via XInput and returns its state in Xbox wire format.
 func PollGamepad(index uint8) GamepadState {
-	if procGetState == nil || index > 3 {
+	if (addrGetStateEx == 0 && procGetState == nil) || index > 3 {
 		return GamepadState{Index: index}
 	}
 	var st xinputState
-	ret, _, _ := procGetState.Call(uintptr(index), uintptr(unsafe.Pointer(&st)))
+	var ret uintptr
+	if addrGetStateEx != 0 {
+		ret, _, _ = syscall.SyscallN(addrGetStateEx, uintptr(index), uintptr(unsafe.Pointer(&st)))
+	} else {
+		ret, _, _ = procGetState.Call(uintptr(index), uintptr(unsafe.Pointer(&st)))
+	}
 	if ret != 0 {
 		return GamepadState{Index: index, Connected: false}
 	}

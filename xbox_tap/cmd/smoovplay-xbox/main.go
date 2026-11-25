@@ -272,6 +272,7 @@ func cmdPlay(ctx context.Context, args []string) error {
 		cfg.TargetID = chosen.ServerID
 	}
 
+	setHighPriority()
 	log.Printf("[xbox-tap] start SmoovPlay with: python run.py --source tap --display --present dxgi --fullscreen")
 	return session.Run(ctx, client, cfg)
 }
