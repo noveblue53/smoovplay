@@ -105,7 +105,8 @@ def test_fullscreen_is_a_borderless_window_so_alt_tab_works():
         DECORATED, FALSE, TRUE = 1, 0, 1
 
         def __getattr__(self, name):
-            out = {"get_window_pos": (80, 80), "get_window_size": (1600, 900), "get_monitor_pos": (0, 0)}.get(
+            out = {"get_window_pos": (80, 80), "get_window_size": (1600, 900), "get_monitor_pos": (0, 0),
+                   "get_monitors": ["only"]}.get(
                 name, SimpleNamespace(size=SimpleNamespace(width=2560, height=1440)))
             return lambda *a: calls.append(name) or out
 

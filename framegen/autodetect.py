@@ -44,6 +44,46 @@ TRT_SPEEDUP = 0.88  # TensorRT's time at full motion detail vs PyTorch's, when i
 # Frame rate and motion detail, best first. 90 fps at full detail beats 120 at half: in testing it looked better.
 OPTIONS = ((120, "full"), (90, "full"), (120, "half"), (90, "half"), (60, "full"), (60, "half"))
 VFG_QUALITIES = ("high", "medium", "low")  # NVIDIA VFG's modes, most careful first
+# Next to the settings file: the last test's times on this graphics card, which Auto motion detail goes by (run.py)
+TIMING_FILE = "card-timing.json"
+
+
+def timing_path(settings_path: Path) -> Path:
+    return Path(settings_path).with_name(TIMING_FILE)
+
+
+def save_timing(settings_path: Path, gpu: str, timing: dict) -> None:
+    """Keeps this test's times (time_rife()'s result) for Auto motion detail. Best effort: a settings folder that
+    can't be written to only means Auto goes by its plain rule."""
+    try:
+        path = timing_path(settings_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"gpu": gpu, "timing": timing}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def saved_full_ms(settings_path: Path, gpu: str) -> float | None:
+    """The last test's time at full motion detail on this graphics card, in ms; None if there's none, or it was
+    another card's."""
+    try:
+        saved = json.loads(timing_path(settings_path).read_text(encoding="utf-8"))
+        return float(saved["timing"]["full"]["ms"]) if saved.get("gpu") == gpu else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def auto_scale(w: int, h: int, hz: int, full_ms: float | None = None, share: float = SHARE) -> float:
+    """Auto motion detail for a w x h stream at hz: a quarter for 4K; half at 120 fps, or for a capture bigger than
+    1080p at 90 (on an RTX 4070 Ti SUPER, scripts/benchmark.py); and half where this test's time at full detail
+    (full_ms, at 1080p) doesn't fit a frame at hz on this graphics card, by recommend()'s own rule. Else full."""
+    if h > 1440:
+        return 0.25
+    if hz == 120 or (h > 1080 and hz >= 90):
+        return 0.5
+    if h <= 1080 and full_ms is not None and full_ms > share * 1000 / hz:
+        return 0.5
+    return 1.0
 
 
 @dataclass(frozen=True)
@@ -296,7 +336,9 @@ def recommend(current: dict, timing: dict, display: Display | None, *, gpu: str 
         reasons["hz"] = (f"At {_fps(top)} each frame has {1000 / top:.1f} ms, but your graphics card needs {need:.1f} "
                          f"ms for an in-between frame. {_fps(hz)} leaves it enough time.")
 
-    # ---- motion detail (run.py: Auto is half at 120 fps for a stream up to 1440p, full otherwise)
+    # ---- motion detail (auto_scale(): Auto is half at 120 fps for a stream up to 1440p, and where full doesn't fit
+    # by this test's times; full otherwise). Half for that second reason is still saved as Half, not Auto: it holds
+    # if the times file goes.
     auto_motion = "half" if hz == 120 else "full"
     settings["motion"] = "auto" if motion == auto_motion else motion
     if motion == "half" and hz < 120:
@@ -522,6 +564,7 @@ def detect(current: dict, log: Callable[[str], None] = print, timing: dict | Non
     result["timing"] = timing
     result["vfg_timing"] = vfg
     result["busy"] = smi.get("busy")
+    result["gpu"] = gpu
     return result
 
 
@@ -553,6 +596,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[detect] ERROR: {e}", flush=True)
         return 2
     print(PREFIX + json.dumps(result), flush=True)  # ASCII (\u escapes), whatever the console's code page
+    if timing is None and (result.get("busy") or 0) < 30:  # measured here, and not slowed by something else running
+        save_timing(a.settings, result["gpu"], result["timing"])
     if a.apply and a.if_new and (result.get("busy") or 0) >= 30:
         # Setup: suggestions from a busy card would be too low, and nobody is looking at them. The defaults stay.
         print(f"[detect] the graphics card was {result['busy']}% busy, so nothing was saved", flush=True)

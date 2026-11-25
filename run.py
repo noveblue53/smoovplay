@@ -532,18 +532,29 @@ def main() -> int:
         print(f"[run] {vfg_why[0]} Using {BY_KEY['model'].name(rife)}.")
         settings.override("model", rife)  # this run only: the saved choice comes back once VFG is set up
 
+    # Auto motion detail also goes by Auto-detect's last time at full detail on this graphics card: where that doesn't
+    # fit a frame (an RTX 20 card at 60 fps), Auto is half
+    from framegen.autodetect import LAPTOP_SHARE, SHARE, auto_scale, saved_full_ms
+    card = gpu_name()
+    card_full_ms = None if a.settings.lower() == "none" else saved_full_ms(Path(a.settings), card)
+    card_share = LAPTOP_SHARE if "laptop" in card.lower() else SHARE
+    if (a.scale is None and settings.motion == "auto" and card_full_ms is not None
+            and auto_scale(src.w, src.h, settings.hz, card_full_ms, card_share) < auto_scale(src.w, src.h, settings.hz)):
+        print(f"[run] motion detail Auto: half, as Auto-detect timed full detail at {card_full_ms:.1f} ms on this "
+              f"graphics card, more than {settings.hz} fps leaves")
+
     def session_config() -> dict:
         """What a session is built from; a restart is needed when this changes (keys: settings.SPECS)."""
         if (test_model or settings.model) == "vfg" and not dml_mode:
             return {"model": "vfg", "vfg_quality": settings.vfg_quality}
         if a.scale is not None:
             scale = a.scale
-        else:  # Auto. On an RTX 4070 Ti SUPER (scripts/benchmark.py), per 30 fps game frame (33 ms): 120 Hz at 1080p
-            # needs half (full ~54 ms with display work); 1440p at 90 too (38 ms; half 26); 4K even at 60 Hz needs a
-            # quarter (full 52 ms, half 36, quarter 30: its motion worked out at 960x540, as half's is at 1080p).
-            scale = {"full": 1.0, "half": 0.5}.get(settings.motion) or (
-                0.25 if src.h > 1440 else
-                0.5 if settings.hz == 120 or (src.h > 1080 and settings.hz >= 90) else 1.0)
+        else:  # Auto (autodetect.auto_scale). On an RTX 4070 Ti SUPER (scripts/benchmark.py), per 30 fps game frame
+            # (33 ms): 120 Hz at 1080p needs half (full ~54 ms with display work); 1440p at 90 too (38 ms; half 26); 4K
+            # even at 60 Hz needs a quarter (full 52 ms, half 36, quarter 30: its motion worked out at 960x540, as
+            # half's is at 1080p).
+            scale = {"full": 1.0, "half": 0.5}.get(settings.motion) or auto_scale(
+                src.w, src.h, settings.hz, card_full_ms, card_share)
         engine = auto_engine(scale) if settings.engine == "auto" else settings.engine
         if dml_mode:
             engine = "dml"

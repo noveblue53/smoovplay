@@ -176,6 +176,8 @@ class _Uneven:
         self.closed = True
 
 
+@pytest.mark.skipif(sys.platform == "darwin", reason="a real-time beat: on GitHub's shared macOS machines it came out "
+                    "7.5 ms off where the test allows 3 (24 Nov), and SmoovPlay doesn't run on macOS yet")
 def test_clock60_puts_uneven_frames_on_a_steady_beat():
     gaps = [0.0, 0.035, 0.004, 0.06, 0.012, 0.03]
     clock = Clock60(_Uneven(gaps), hz=100)

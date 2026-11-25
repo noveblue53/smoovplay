@@ -18,6 +18,7 @@ import numpy as np
 
 from . import display_sync
 from .fill import Panorama, layout, panorama_t, visible, wider
+from .glblit import Blitter
 
 TICK = 1.0 / 60.0
 
@@ -398,6 +399,18 @@ def windows_hdr_on() -> bool:
         return False
 
 
+def window_monitor(win: tuple[int, int, int, int], monitors: list[tuple]):
+    """The monitor a window (x, y, w, h) is mostly on, of monitors given as (handle, x, y, w, h): the one with the
+    most of the window on it, or the first (GLFW lists the primary monitor first) when it's on none of them."""
+    x, y, w, h = win
+    best, most = monitors[0][0], 0
+    for mon, mx, my, mw, mh in monitors:
+        area = max(0, min(x + w, mx + mw) - max(x, mx)) * max(0, min(y + h, my + mh) - max(y, my))
+        if area > most:
+            best, most = mon, area
+    return best
+
+
 def _say_if_slow(what: str, t0: float, limit_ms: float = 250.0) -> None:
     """A line in the log when a window call took far longer than a frame (a stall worth reporting)."""
     ms = (time.perf_counter() - t0) * 1000
@@ -425,10 +438,11 @@ def _gl_image(GL, img: np.ndarray, hdr: bool):
 
 class _Panel:
     """A BGR image in a GL texture of its own, blitted 1:1 over the frame (menu, messages). hdr: over an HDR10
-    picture (see _gl_image)."""
+    picture (see _gl_image). blitter: the window's (framegen/glblit.py)."""
 
-    def __init__(self, GL, hdr: bool = False) -> None:
+    def __init__(self, GL, hdr: bool = False, blitter: Blitter | None = None) -> None:
         self.GL, self.w, self.h, self.hdr = GL, 0, 0, hdr
+        self.blitter = blitter if blitter is not None else Blitter(GL)
         self.tex, self.fbo = GL.glGenTextures(1), GL.glGenFramebuffers(1)
 
     def update(self, img: np.ndarray) -> None:
@@ -448,10 +462,8 @@ class _Panel:
 
     def blit(self, x: int, top: int) -> None:
         """top: GL y of the image's top edge (GL y grows upwards; image rows go down)."""
-        GL = self.GL
-        GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.fbo)
-        GL.glBlitFramebuffer(0, 0, self.w, self.h, x, top, x + self.w, top - self.h, GL.GL_COLOR_BUFFER_BIT,
-                             GL.GL_NEAREST)
+        self.blitter.copy(self.tex, self.w, self.h, self.fbo, (0, 0, self.w, self.h),
+                          (x, top, x + self.w, top - self.h), False)
 
     def close(self) -> None:
         self.GL.glDeleteFramebuffers(1, [self.fbo])
@@ -635,6 +647,7 @@ class GLWindowSink:
         self._keyed = False
         self._took_from: set = set()
 
+        self.blitter = Blitter(GL)  # plain copies to the screen: glBlitFramebuffer, or a shader where it's refused
         self.tex = GL.glGenTextures(1)
         GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
@@ -708,8 +721,10 @@ class GLWindowSink:
         self.choices, self.unavailable = dict(choices or {}), dict(unavailable or {})
         self.note_presentation()
         self.menu = Menu(st, allowed=self.allowed, disabled=self.disabled, restart_reasons=restart_reasons)
-        self.menu_panel, self.toast_panel = _Panel(GL, self.hdr10), _Panel(GL, self.hdr10)
-        self.mini_panel, self._mini_state = _Panel(GL, self.hdr10), None  # the stats overlay, Minimal or Detailed
+        self.menu_panel = _Panel(GL, self.hdr10, self.blitter)
+        self.toast_panel = _Panel(GL, self.hdr10, self.blitter)
+        # the stats overlay, Minimal or Detailed
+        self.mini_panel, self._mini_state = _Panel(GL, self.hdr10, self.blitter), None
         self._detail_w, self._detail_ui = 0, None  # the detailed box's width so far, at this size (it only grows)
         self._menu_top = None  # (GL y of the menu's top, the picture's (y0, height) it was placed in) while it's open
         self._menu_state = self._toast_state = None
@@ -1201,12 +1216,25 @@ class GLWindowSink:
             glfw.set_window_monitor(win, None, x, y, ww, wh, 0)
         else:
             self.windowed_pos = (*glfw.get_window_pos(win), *glfw.get_window_size(win))
-            mon = glfw.get_primary_monitor()
+            mon = self._monitor_under_window()
             mode = glfw.get_video_mode(mon)
             glfw.set_window_monitor(win, mon, 0, 0, mode.size.width, mode.size.height, mode.refresh_rate)
         _say_if_slow("fullscreen " + ("on" if on else "off"), t0)
         self._refresh_next = 0.0  # (it may be on another monitor, or another mode)
         self._update_sync(force=True)
+
+    def _monitor_under_window(self):
+        """Where fullscreen goes: the monitor the window is mostly on, so F fills the screen it was moved to rather
+        than the primary one."""
+        glfw = self.glfw
+        monitors = []
+        for mon in glfw.get_monitors() or []:
+            mode = glfw.get_video_mode(mon)
+            if mode is not None:
+                monitors.append((mon, *glfw.get_monitor_pos(mon), mode.size.width, mode.size.height))
+        if not monitors:
+            return glfw.get_primary_monitor()
+        return window_monitor((*glfw.get_window_pos(self.win), *glfw.get_window_size(self.win)), monitors)
 
     def _set_borderless(self, on: bool) -> None:
         """Fullscreen as a borderless window over the monitor, as games' borderless mode (the standard presentation's
@@ -1219,7 +1247,7 @@ class GLWindowSink:
         t0 = time.perf_counter()
         if on:
             self.windowed_pos = (*glfw.get_window_pos(win), *glfw.get_window_size(win))
-            mon = glfw.get_primary_monitor()
+            mon = self._monitor_under_window()
             mx, my = glfw.get_monitor_pos(mon)
             mode = glfw.get_video_mode(mon)
             glfw.set_window_attrib(win, glfw.DECORATED, glfw.FALSE)
@@ -1367,7 +1395,7 @@ class GLWindowSink:
             GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, self._target())
             GL.glViewport(0, 0, fw, fh)
             GL.glClear(GL.GL_COLOR_BUFFER_BIT)
-            self._blit_last(x0, y0, dw, dh)
+            self._plain(x0, y0, dw, dh)
             dots = "." * (1 + int(time.perf_counter() - t0) % 3)
             self.toast(f"{text}{dots:<3}", 1.0)
             self._draw_ui(*visible(dw, dh, x0, y0, fw, fh))
@@ -1396,7 +1424,7 @@ class GLWindowSink:
             GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, self._target())
             GL.glViewport(0, 0, fw, fh)
             GL.glClear(GL.GL_COLOR_BUFFER_BIT)
-            self._blit_last(x0, y0, dw, dh)  # the last frame, plain (no upscaler or look)
+            self._plain(x0, y0, dw, dh)  # the last frame, plain (no upscaler or look)
             self._draw_ui(*visible(dw, dh, x0, y0, fw, fh))
             self._present()
         self.settle()
@@ -1488,10 +1516,7 @@ class GLWindowSink:
             self._vsr_draw(target, x0, y0, dw, dh, frame if direct_vsr else None)
             GL.glViewport(0, 0, fw, fh)
         else:
-            GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.fbo)
-            # Image row 0 is the top; GL row 0 is the bottom, so blit with destination Y flipped.
-            GL.glBlitFramebuffer(0, 0, self.w, self.h, x0, y0 + dh, x0 + dw, y0, GL.GL_COLOR_BUFFER_BIT,
-                                 GL.GL_LINEAR)
+            self._plain(x0, y0, dw, dh)
         if pano:
             self.panorama.draw(screen, fw, fh, panorama_t(fw, fh, self.w, self.h))
             label += " + panorama"
@@ -1514,16 +1539,20 @@ class GLWindowSink:
         cmd, self.cmd = self.cmd, None
         return cmd
 
+    def _plain(self, x0: int, y0: int, dw: int, dh: int) -> None:
+        """The frame's texture into the picture's rectangle with no upscaler: a bilinear copy (blit) to the bound
+        draw framebuffer. Image row 0 is the top and GL's row 0 the bottom, so the destination's Y is flipped."""
+        self.blitter.copy(self.tex, self.w, self.h, self.fbo, (0, 0, self.w, self.h), (x0, y0 + dh, x0 + dw, y0),
+                          True)
+
     def _vsr_draw(self, target: int, x0: int, y0: int, dw: int, dh: int, frame=None) -> None:
         """RTX VSR from the staged RGBA frame (or direct frame) straight into a window-sized GL texture, then either
         an RCAS sharpening pass or a 1:1 blit."""
-        GL = self.GL
         tex, fbo = self._vsr_render(dw, dh, frame)
         if (sharp := self._vsr_rcas()) is not None:
             self.fsr.sharpen(tex, target, x0, y0, dw, dh, sharp)
             return
-        GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, fbo)
-        GL.glBlitFramebuffer(0, 0, dw, dh, x0, y0 + dh, x0 + dw, y0, GL.GL_COLOR_BUFFER_BIT, GL.GL_NEAREST)
+        self.blitter.copy(tex, dw, dh, fbo, (0, 0, dw, dh), (x0, y0 + dh, x0 + dw, y0), False)
 
     def _vsr_render(self, dw: int, dh: int, frame=None) -> tuple[int, int]:
         """RTX VSR into the window-sized texture (row 0 = the image's top); returns (texture, framebuffer)."""
@@ -1684,6 +1713,7 @@ class GLWindowSink:
         self.menu_panel.close()
         self.toast_panel.close()
         self.mini_panel.close()
+        self.blitter.close()
         if self.vsr is not None:
             self._vsr_target_free()
             self.vsr.close()

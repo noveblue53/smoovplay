@@ -12,6 +12,7 @@ and how to get it, see the [README](../../README.md).
 | [`run.py`](../run.py) | Command-line entry point. |
 | [`chiaki_tap/`](../chiaki_tap/) | The patch that adds a frame tap to chiaki-ng, and how to build it. |
 | [`docs/frame-tap.md`](frame-tap.md) | The frame tap's format, so any app can send its frames to SmoovPlay (Experimental), with a small C writer to start from. |
+| [`docs/macos.md`](macos.md), [`docs/linux.md`](linux.md) | macOS benchmarks, and PS5 Remote Play on Linux. Experimental and community-run: we don't test or support them ourselves. |
 | [`installer/`](../installer/) | `SmoovPlay-Setup.exe` and the SmoovPlay launcher, in C# and WPF. |
 | [`native/rtxvsr/`](../native/rtxvsr/) | Optional wrapper around NVIDIA's RTX Video SDK. |
 | [`scripts/`](../scripts/) | Benchmarks, a model check and a fake chiaki-ng stream for testing without a PS5. |
@@ -123,6 +124,9 @@ and upscaler for this PC, with the reason for each; **Apply** sets them. It take
   half, as in testing.
 - It notes anything worth fixing: a display Windows runs below its top rate, a graphics card busy with something
   else, or a frame rate that needs G-Sync or FreeSync for even motion.
+- It keeps its times next to the settings file (`card-timing.json`, with the card's name). Auto motion detail goes
+  by them: for a stream up to 1080p, it's half wherever full doesn't fit 90% of a tick on that card (an RTX 2080 Ti
+  at 60 fps, for one). The times aren't kept if the card was busy, or if they came from `--timing`.
 
 Setup runs it on a new install (`python -m framegen.prepare` → `python -m framegen.autodetect --apply --if-new`),
 and doesn't save if the card is busy. The logic is `recommend()` in `framegen/autodetect.py`; the tests try it on
@@ -247,6 +251,11 @@ When the window is bigger than the frame (fullscreen on a 1440p monitor, say), i
     picks it when NVIDIA's package is there too.
 
 The overlay names the scaler in use, and the GPU time per frame is printed on exit.
+
+Where no upscaler runs (the window is the frame's size or smaller, or Bilinear), and for the menu and messages,
+the frame is copied with `glBlitFramebuffer`. A driver that refuses that (an AMD one did, on the first frame) gets
+the same copy drawn by a shader from then on, said once in the log (`framegen/glblit.py`). `FRAMEGEN_BLIT=shader`
+uses the shader from the start, to try that path on any card.
 </details>
 
 <details>

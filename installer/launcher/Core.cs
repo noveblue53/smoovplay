@@ -544,11 +544,16 @@ namespace SmoovPlay
         /// <summary>Where NVIDIA VFG is (or would go): Paths.Vfx, set once the launcher knows its paths.</summary>
         public static string VfxPath;
 
-        /// <summary>A Python process with UTF-8, unbuffered output. The embeddable Python ignores PYTHON* variables
-        /// (its ._pth file puts it in isolated mode), hence -u and -X utf8 on the command line.</summary>
+        /// <summary>A Python process with UTF-8, unbuffered output. The embeddable Python ignores most PYTHON*
+        /// variables (its ._pth file puts it in isolated mode), hence -u and -X utf8 on the command line.
+        /// -s: never the user's own site-packages (%APPDATA%\Python\Python312\site-packages). Isolated mode doesn't
+        /// leave it out, so with a regular Python 3.12 on the PC, pip counted that folder's packages as installed,
+        /// uninstalled the user's copies when it wanted other versions, and the runtime came to need them.
+        /// PYTHONNOUSERSITE, which the embeddable Python does read, keeps it out of the Pythons this one starts
+        /// (pip's, and framegen's subprocesses) too.</summary>
         public static ProcessStartInfo Python(string python, string args, string cwd)
         {
-            var psi = new ProcessStartInfo(python, "-u -X utf8 " + args)
+            var psi = new ProcessStartInfo(python, "-u -X utf8 -s " + args)
             {
                 WorkingDirectory = cwd, UseShellExecute = false, CreateNoWindow = true,
                 RedirectStandardOutput = true, RedirectStandardError = true,
@@ -557,6 +562,7 @@ namespace SmoovPlay
             psi.EnvironmentVariables["PYTHONUNBUFFERED"] = "1";  // for a dev venv Python, which does read them
             psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
             psi.EnvironmentVariables["PIP_DISABLE_PIP_VERSION_CHECK"] = "1";
+            psi.EnvironmentVariables["PYTHONNOUSERSITE"] = "1";
             if (!string.IsNullOrEmpty(VfxPath)) psi.EnvironmentVariables["FRAMEGEN_VFX_PATH"] = VfxPath;  // a plain variable: the embeddable Python passes it on
             return psi;
         }
@@ -910,7 +916,8 @@ namespace SmoovPlay
         {
             if (Missed.Count == 0) return null;
             var m = Missed.First();
-            string fix = m.Value.Contains("minimised") ? "restore its window"
+            string fix = m.Value.Contains("full screen") ? "leave full screen (its full screen button, or Shift+Win+Enter)"
+                       : m.Value.Contains("minimised") ? "restore its window"
                        : m.Value.Contains("another desktop") ? "bring its window to this desktop"
                        : m.Value.Contains("too small") ? "make its window bigger"
                        : "open its window (not just the tray icon) and start streaming";

@@ -30,10 +30,22 @@ GAP_S = 1.2  # from an answer (or giving up) to the next press
 MIN_CHANGE = 6.0  # brightness levels: the smallest change that counts as an answer, however still the picture
 
 
+BLOCKS = (18, 32)
+SAMPLES = 15  # pixels looked at across each block (and down it): every 4th at 1080p, whose blocks are 60 px
+
+
+def step(h: int, w: int) -> int:
+    """How far apart small() reads pixels: 4 at 1080p, 8 at 4K, every pixel in a frame too small to spare any."""
+    return max(1, min(h // (BLOCKS[0] * SAMPLES), w // (BLOCKS[1] * SAMPLES)))
+
+
 def small(frame_u8: torch.Tensor) -> np.ndarray:
-    """A frame (HxWx3 uint8 BGR, any device) as 18x32 blocks of brightness."""
-    grey = frame_u8.float() @ torch.tensor([0.114, 0.587, 0.299], device=frame_u8.device)
-    return F.adaptive_avg_pool2d(grey[None, None], (18, 32))[0, 0].cpu().numpy()
+    """A frame (HxWx3 uint8 BGR, any device) as 18x32 blocks of brightness. Only every step()th pixel is read: with
+    DirectML the frame is in the CPU's memory, where turning a whole 1080p frame into floats took 5 ms each tick,
+    and a block's average comes out the same to within a brightness level."""
+    s = step(*frame_u8.shape[:2])
+    grey = frame_u8[::s, ::s].float() @ torch.tensor([0.114, 0.587, 0.299], device=frame_u8.device)
+    return F.adaptive_avg_pool2d(grey[None, None], BLOCKS)[0, 0].cpu().numpy()
 
 
 def change(a: np.ndarray, b: np.ndarray) -> float:

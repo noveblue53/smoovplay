@@ -101,6 +101,18 @@ def test_small_is_18x32_brightness():
     assert b.shape == (18, 32) and np.allclose(b, 0.299 * 255, atol=0.01)
 
 
+def test_small_reads_every_4th_pixel_of_a_1080p_frame_and_still_gets_each_block():
+    # With DirectML the frame is on the CPU, where reading all of it cost 5 ms each tick
+    assert dt.step(1080, 1920) == 4 and dt.step(2160, 3840) == 8 and dt.step(720, 1280) == 2
+    assert dt.step(36, 64) == 1
+    g = torch.Generator().manual_seed(0)
+    blocks = torch.randint(0, 256, (18, 32, 3), dtype=torch.uint8, generator=g)
+    noise = torch.randint(-3, 4, (1080, 1920, 3), generator=g)
+    f = (blocks.repeat_interleave(60, 0).repeat_interleave(60, 1).int() + noise).clamp(0, 255).to(torch.uint8)
+    every = (f.float() @ torch.tensor([0.114, 0.587, 0.299])).reshape(18, 60, 32, 60).mean((1, 3)).numpy()
+    assert np.abs(dt.small(f) - every).max() < 1.0  # within a brightness level of reading every pixel
+
+
 # ---- in the pipeline: L starts it, the overlay shows it, the report and the log say what it found
 class _Sink:
     gpu = False

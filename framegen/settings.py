@@ -160,11 +160,13 @@ SPECS: tuple[Spec, ...] = (
                  "speed": "TensorRT is about 12% faster at full motion detail, PyTorch at half."}),
     Spec("motion", "Motion detail", ("auto", "full", "half"), "auto",
          {"auto": "Auto", "full": "Full", "half": "Half"}, live=False, group="Smoothness", applies=("model", ("4.22.lite",)),
-         hints={"auto": "Full; Half at 120 fps or a 1440p capture at 90; less for 4K. Recommended.", "full": "Sharpest on fast motion. The slowest.",
+         hints={"auto": "Full; Half at 120 fps, a 1440p capture at 90, or where Full is too slow for this card; less for 4K. Recommended.",
+                "full": "Sharpest on fast motion. The slowest.",
                 "half": "About 40% faster. A little softer on fast detail."},
          help="How finely RIFE tracks movement. Full follows small, fast details best, like railings or distant "
-              "cars; Half takes about 40% less time but softens them a little. Auto uses Half at 120 fps or for a "
-              "1440p capture at 90, a quarter for a 4K capture, and Full otherwise. Only used with RIFE.",
+              "cars; Half takes about 40% less time but softens them a little. Auto uses Half at 120 fps, for a "
+              "1440p capture at 90, or where Auto-detect timed Full too slow for your graphics card at the frame "
+              "rate you picked; a quarter for a 4K capture; and Full otherwise. Only used with RIFE.",
          impact={"picture": "Half is a little softer on small, fast details.",
                  "speed": "Half takes about 40% less time per AI frame."}),
     # A test mode (framegen/sources.py TestMode), for any source that sends every frame (not App window: run.py).

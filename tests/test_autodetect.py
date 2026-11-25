@@ -1,7 +1,7 @@
 """Auto-detect's choices (framegen.autodetect.recommend) for made-up PCs. No GPU needed."""
 import re
 
-from framegen.autodetect import Display, recommend, vfg_offer
+from framegen.autodetect import Display, auto_scale, recommend, save_timing, saved_full_ms, vfg_offer
 from framegen.settings import BY_KEY, SPECS
 
 DEFAULTS = {s.key: s.default for s in SPECS}
@@ -142,3 +142,39 @@ def test_detect_offers_vfg_only_where_it_can_be_set_up(monkeypatch):
                 "NVIDIA VFG couldn't be checked: boom"):
         r = _detect_on(monkeypatch, why)
         assert "vfg_offer" not in r and "vfg_offer_ready" not in r, why
+
+
+# ---- Auto motion detail (run.py) goes by the test's last time at full detail on this card
+def test_auto_motion_is_half_where_full_doesnt_fit_this_card():
+    assert auto_scale(1920, 1080, 60) == 1.0  # no times saved: the plain rule
+    assert auto_scale(1920, 1080, 60, 19.7) == 0.5  # an RTX 2080 Ti: full takes 19.7 ms, 60 fps leaves 15
+    assert auto_scale(1920, 1080, 60, 14.4) == 1.0
+    assert auto_scale(1920, 1080, 90, 9.3) == 1.0  # the card the rule was tuned on keeps full at 90
+    assert auto_scale(1920, 1080, 90, 10.5) == 0.5
+    assert auto_scale(1920, 1080, 60, 14.4, share=0.80) == 0.5  # a laptop's smaller share
+    assert auto_scale(1920, 1080, 120, 5.0) == 0.5  # 120 fps is half anyway
+    # Captures bigger than 1080p keep their own rule: the test only times 1080p
+    assert auto_scale(2560, 1440, 60, 19.7) == 1.0 and auto_scale(2560, 1440, 90) == 0.5
+    assert auto_scale(3840, 2160, 60, 5.0) == 0.25
+
+
+def test_the_tests_times_are_kept_for_that_card_only(tmp_path):
+    settings = tmp_path / "framegen" / "settings.json"  # its folder isn't there yet, as on a new install
+    assert saved_full_ms(settings, "NVIDIA GeForce RTX 2080 Ti") is None
+    save_timing(settings, "NVIDIA GeForce RTX 2080 Ti", timing(19.7, 14.5))
+    assert saved_full_ms(settings, "NVIDIA GeForce RTX 2080 Ti") == 19.7
+    assert saved_full_ms(settings, "NVIDIA GeForce RTX 4070") is None  # another card since
+    settings.with_name("card-timing.json").write_text("{not json", encoding="utf-8")
+    assert saved_full_ms(settings, "NVIDIA GeForce RTX 2080 Ti") is None
+
+
+def test_detect_saves_its_times_only_when_it_measured_them(monkeypatch, tmp_path):
+    from framegen import autodetect
+    _detect_on(monkeypatch, "")
+    monkeypatch.setattr(autodetect, "time_rife", lambda model, log=print: timing(19.7, 14.5))
+    monkeypatch.setattr(autodetect, "time_vfg", lambda log=print: None)
+    settings = tmp_path / "settings.json"
+    assert autodetect.main(["--settings", str(settings), "--timing", "9.3,6.8"]) == 0  # made-up times: not kept
+    assert saved_full_ms(settings, "NVIDIA GeForce RTX 4070") is None
+    assert autodetect.main(["--settings", str(settings)]) == 0
+    assert saved_full_ms(settings, "NVIDIA GeForce RTX 4070") == 19.7

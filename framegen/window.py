@@ -57,6 +57,11 @@ MIN_SIZE = (320, 180)  # smaller windows aren't game streams
 # Store (UWP) apps don't own their top-level window: Windows' ApplicationFrameHost.exe draws the frame, and the app's
 # own window (a Windows.UI.Core.CoreWindow) sits inside it. Such a frame is listed under the app inside it.
 STORE_FRAME = "applicationframehost.exe"
+STORE_FRAME_CLASS = "ApplicationFrameWindow"
+FULL_SCREEN = "in full screen"  # find_windows' reason for a Store app in full screen, which isn't listed
+# Streaming apps' Store packages (an AppUserModelID's part before "!"), for a frame whose app is suspended: in full
+# screen, switching to another window (the launcher, to press Look again) suspends it and takes its window out.
+STORE_PACKAGES = {"microsoft.gamingapp_8wekyb3d8bbwe": "xboxpcapp.exe"}
 SKIP_EXE = {"explorer.exe", "textinputhost.exe", STORE_FRAME, "shellexperiencehost.exe",
             "searchhost.exe", "startmenuexperiencehost.exe", "systemsettings.exe", "smoovplay.exe"}
 CHECK_S = 0.5  # how often the window's place is looked at
@@ -220,6 +225,59 @@ def _hosted_exe(frame: int, cache: dict) -> str:
     return ""
 
 
+class _GUID(ctypes.Structure):
+    _fields_ = [("a", wt.DWORD), ("b", wt.WORD), ("c", wt.WORD), ("d", ctypes.c_ubyte * 8)]
+
+
+class _PROPERTYKEY(ctypes.Structure):
+    _fields_ = [("fmtid", _GUID), ("pid", wt.DWORD)]
+
+
+class _PROPVARIANT(ctypes.Structure):
+    _fields_ = [("vt", wt.USHORT), ("r1", wt.USHORT), ("r2", wt.USHORT), ("r3", wt.USHORT),
+                ("ptr", ctypes.c_void_p), ("pad", ctypes.c_void_p)]
+
+
+def _aumid(hwnd: int) -> str:
+    """A window's AppUserModelID (the shell's PKEY_AppUserModel_ID), "" if it has none or it can't be read. A Store
+    app's frame keeps its app's even while the app inside is suspended. COM is set up for the call and the thread
+    left as it was."""
+    try:
+        ole32, shell32 = ctypes.windll.ole32, ctypes.windll.shell32
+        iid = _GUID(0x886D8EEB, 0x8CF2, 0x4446, (ctypes.c_ubyte * 8)(0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99))
+        key = _PROPERTYKEY(_GUID(0x9F4C2855, 0x9F79, 0x4B39,
+                                 (ctypes.c_ubyte * 8)(0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3)), 5)
+        ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wt.DWORD]
+        ours = ole32.CoInitializeEx(None, 2) in (0, 1)  # S_OK / S_FALSE: balance it; RPC_E_CHANGED_MODE: leave it
+        try:
+            shell32.SHGetPropertyStoreForWindow.argtypes = [wt.HWND, ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)]
+            store = ctypes.c_void_p()
+            if shell32.SHGetPropertyStoreForWindow(hwnd, ctypes.byref(iid), ctypes.byref(store)) != 0 or not store:
+                return ""
+            vtbl = ctypes.cast(ctypes.cast(store, ctypes.POINTER(ctypes.c_void_p))[0], ctypes.POINTER(ctypes.c_void_p))
+            get_value = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(_PROPERTYKEY),
+                                           ctypes.POINTER(_PROPVARIANT))(vtbl[5])  # IPropertyStore::GetValue
+            release = ctypes.WINFUNCTYPE(wt.ULONG, ctypes.c_void_p)(vtbl[2])
+            pv = _PROPVARIANT()
+            try:
+                ok = get_value(store, ctypes.byref(key), ctypes.byref(pv)) == 0
+                return ctypes.wstring_at(pv.ptr) if ok and pv.vt == 31 and pv.ptr else ""  # VT_LPWSTR
+            finally:
+                ole32.PropVariantClear(ctypes.byref(pv))
+                release(store)
+        finally:
+            if ours:
+                ole32.CoUninitialize()
+    except (OSError, AttributeError, ValueError):
+        return ""
+
+
+def _store_app_of(frame: int, cache: dict) -> str:
+    """The program of the app in a Store app's frame: the one inside it, or for a suspended streaming app, its
+    program by its AppUserModelID. "" if neither."""
+    return _hosted_exe(frame, cache) or STORE_PACKAGES.get(_aumid(frame).split("!")[0].lower(), "")
+
+
 def client_rect(hwnd: int) -> Rect | None:
     """The window's picture area on screen, in pixels; None if it's gone or minimised."""
     u32, _, _ = _api()
@@ -292,14 +350,20 @@ def find_windows(left_out: dict | None = None) -> list[AppWindow]:
     left_out, if given, gets why a streaming app (PRESETS) that's running wasn't listed: {program: {reasons}}, for
     the launcher's hint and diagnostics. Only those apps' programs are noted, never other windows or titles."""
     u32, _, dwm = _api()
-    own, exes, found = os.getpid(), {}, []
+    own, exes, found, seen = os.getpid(), {}, [], set()
 
     def note(exe: str, why: str) -> None:
         if left_out is not None and exe in PRESET_EXES:
             left_out.setdefault(exe, set()).add(why)
 
+    def is_cloaked(hwnd) -> bool:
+        cloaked = wt.DWORD()
+        dwm.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))  # DWMWA_CLOAKED
+        return bool(cloaked.value)
+
     @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
     def each(hwnd, _):
+        seen.add(hwnd)
         pid = wt.DWORD()
         u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         if pid.value == own:
@@ -314,9 +378,7 @@ def find_windows(left_out: dict | None = None) -> list[AppWindow]:
             exe = _hosted_exe(hwnd, exes)
         if not exe or exe in SKIP_EXE:
             return True
-        cloaked = wt.DWORD()
-        dwm.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))  # DWMWA_CLOAKED
-        if cloaked.value:
+        if is_cloaked(hwnd):
             note(exe, "on another desktop, or not shown yet")
             return True
         n = u32.GetWindowTextLengthW(hwnd)
@@ -337,6 +399,19 @@ def find_windows(left_out: dict | None = None) -> list[AppWindow]:
         return True
 
     u32.EnumWindows(each, 0)
+    if left_out is not None:
+        # A Store app in full screen (the Xbox app's own full screen, or Shift+Win+Enter): Windows moves its frame out
+        # of the desktop's layer of windows into one of its own (an "immersive" z-order band), and since Windows 8
+        # EnumWindows lists only the desktop's. FindWindowEx still finds the frame. It's noted rather than listed: an
+        # ordinary window, as SmoovPlay's is, may not be able to show over it. Switched away from, it's also cloaked
+        # and its app suspended, which is when someone presses Look again: still noted, the app known by its ID.
+        frame = u32.FindWindowExW(None, None, STORE_FRAME_CLASS, None)
+        for _ in range(256):  # a handful of frames; the cap only guards against a loop
+            if not frame:
+                break
+            if frame not in seen and u32.IsWindowVisible(frame):
+                note(_store_app_of(frame, exes), FULL_SCREEN)
+            frame = u32.FindWindowExW(None, frame, STORE_FRAME_CLASS, None)
     if left_out is not None:  # an app with a window listed isn't missing, whichever of its programs drew it
         listed = {w.app for w in found}
         for exe in [e for e in left_out if KNOWN[e] in listed]:
@@ -583,8 +658,16 @@ def _cuda() -> bool:
 
 def open_window(query: str) -> WindowSource:
     """--window QUERY: the window, or a clear error naming what was looked for."""
-    target = pick(query)
+    left_out: dict = {}
+    target = pick(query, find_windows(left_out))
     if target is None:
+        # The app asked for ("exe:NAME" in the query; any app if it names none) in full screen: say how to leave it
+        asked = {KNOWN.get(q.strip()[4:].strip().lower().removesuffix(".exe") + ".exe")
+                 for q in query.split("|") if q.strip().lower().startswith("exe:")} - {None}
+        full = sorted(KNOWN[e] for e, why in left_out.items() if FULL_SCREEN in why and (not asked or KNOWN[e] in asked))
+        if full:
+            raise RuntimeError(f"the {full[0]} is in full screen, where SmoovPlay can't find its window: leave full "
+                               "screen (its full screen button, or Shift+Win+Enter), then press Play again")
         raise RuntimeError(f"no app window matches {query!r}: open the app and start streaming, then press Play again "
                            "(python -m framegen.window --list shows what's found)")
     return WindowSource(target, size=SIZE)

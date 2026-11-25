@@ -11,6 +11,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import re
 import sys
 import urllib.request
 
@@ -30,8 +31,9 @@ def live_counts() -> dict[str, int]:
         with urllib.request.urlopen(req, timeout=30) as r:
             releases = json.load(r)
         for rel in releases:
-            if not rel.get("draft"):
-                out[rel["tag_name"]] = sum(a["download_count"] for a in rel["assets"] if a["name"] == SETUP)
+            setups = [a["download_count"] for a in rel["assets"] if a["name"] == SETUP]
+            if setups and not rel.get("draft"):  # source-only pre-releases (community-preview-1) have no setup
+                out[rel["tag_name"]] = sum(setups)
         if len(releases) < 100:
             return out
         page += 1
@@ -67,8 +69,8 @@ def main(stats_dir: str) -> int:
         w = csv.writer(f)
         if new:
             w.writerow(["time_utc", "setup_downloads", "by_release"])
-        tags = sorted(set(base) | set(live), key=lambda t: [int(x) for x in t.lstrip("v").split("-")[0].split(".")],
-                      reverse=True)
+        tags = sorted(set(base) | set(live), key=lambda t: [int(x) for x in re.findall(r"\d+", t.split("-")[0])],
+                      reverse=True)  # newest version first; a tag that isn't one (community-preview-1) goes last
         w.writerow([dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"), total,
                     ";".join(f"{t}={base.get(t, 0) + live.get(t, 0)}" for t in tags)])
     print(f"downloads: {before if before is not None else '-'} -> {total:,} ({short(total)})")

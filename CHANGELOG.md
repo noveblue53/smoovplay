@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.3.13
+
+**Install**
+- **Setup no longer uses or uninstalls the packages of your own Python 3.12**
+  ([#53](https://github.com/smoovplay/smoovplay/issues/53)). SmoovPlay's Python also read the folder where
+  `pip install --user` puts packages for a regular Python 3.12. So setup counted those as already installed, removed
+  your own copies when it wanted other versions, and SmoovPlay came to depend on them. It now leaves that folder
+  alone, at install and while you play, and the update puts whatever it skipped into SmoovPlay's own folder. Packages
+  it already removed from your Python come back with `pip install --user`. Thanks to
+  [@NewAiCoder](https://github.com/NewAiCoder) for the precise report and the fix!
+
+**AMD and Intel graphics** (Experimental)
+- **No more crash on the first frame with some AMD drivers**
+  ([#59](https://github.com/smoovplay/smoovplay/issues/59)). When the window was smaller than the stream, the
+  driver of an RX 6750 XT refused the call SmoovPlay draws the picture with, and the window closed. SmoovPlay now
+  draws it another way when that happens.
+
+## 0.3.12
+
+**App window** (Experimental)
+- **The Xbox app in full screen is no longer just missing from the list**
+  ([#49](https://github.com/smoovplay/smoovplay/issues/49), [#43](https://github.com/smoovplay/smoovplay/issues/43)). In
+  full screen, Windows moves a Store app's window out of the list of windows SmoovPlay reads, so the Xbox app wasn't
+  offered, and nothing said why. The launcher now says it's in full screen and how to leave it (its full screen button,
+  or Shift+Win+Enter), and so does Play. In a window, it's found as before.
+
+**Smoothness**
+- **Auto motion detail picks Half on cards too slow for Full**
+  ([#46](https://github.com/smoovplay/smoovplay/issues/46)). Auto used Full at 60 and 90 fps on any card, and on an RTX
+  2080 Ti Full doesn't keep up even at 60. Auto-detect now keeps its timings, and Auto goes by them: Half wherever Full
+  won't keep up at the frame rate you picked. On an existing install, run Auto-detect once (at the top of the Settings
+  page) to save them.
+
+**AMD and Intel graphics** (Experimental)
+- **The delay test (L) no longer slows the picture** ([#48](https://github.com/smoovplay/smoovplay/issues/48)). It read
+  every pixel of each frame on the CPU, which cost about 5 ms a frame without an NVIDIA card and dropped the frame rate
+  while it ran. It now reads every 4th pixel, with the same result. Thanks to
+  [@DEATHRIDER28310](https://github.com/DEATHRIDER28310) for measuring it!
+
+**Video window**
+- **F goes full screen on the monitor the window is on** ([#30](https://github.com/smoovplay/smoovplay/issues/30)). It
+  always filled the main monitor, so a window moved to a second screen jumped back to the first.
+
 ## 0.3.11
 
 **App window** (Experimental)

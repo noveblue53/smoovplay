@@ -2,6 +2,8 @@
 window or screen is read. Also the learned repeat rule it uses (cadence.DuplicateDetector(learn=True))."""
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pytest
 import torch
@@ -85,13 +87,21 @@ class _Shell:
         600: ("applicationframehost.exe", "Store game",
               [(601, "ApplicationFrameTitleBarWindow", "applicationframehost.exe"), (602, "SomeOtherClass", "storegame.exe")]),
     }
+    IMMERSIVE: set = set()  # frames in full screen: in Windows' own layer, which EnumWindows doesn't list
+    AUMID: dict = {}  # frames' AppUserModelIDs, as the shell has them
 
     def __init__(self, monkeypatch):
+        monkeypatch.setattr(window, "_aumid", lambda h: self.AUMID.get(int(h), ""))
         exe = {h: e for h, (e, _, _) in self.TOP.items()}
         exe |= {c: e for _, _, kids in self.TOP.values() for c, _, e in kids}
         title = {h: t for h, (_, t, _) in self.TOP.items()}
 
         def find_child(parent, after, cls, name):
+            if parent is None:  # top-level windows of a class, wherever they are: here only Store app frames
+                frames = [h for h, (e, _, _) in self.TOP.items() if e == "applicationframehost.exe"]
+                assert cls == "ApplicationFrameWindow"
+                i = frames.index(after) + 1 if after in frames else 0
+                return frames[i] if i < len(frames) else None
             kids = self.TOP.get(parent, (None, None, []))[2]
             if cls is not None:
                 return next((c for c, k, _ in kids if k == cls), None)
@@ -102,7 +112,7 @@ class _Shell:
         def set_pid(h, ref):
             ref._obj.value = h  # a process per window is enough here
         u32 = type("U32", (), {
-            "EnumWindows": staticmethod(lambda each, _: [each(h, 0) for h in self.TOP]),
+            "EnumWindows": staticmethod(lambda each, _: [each(h, 0) for h in self.TOP if h not in self.IMMERSIVE]),
             "IsWindowVisible": staticmethod(lambda h: True), "GetWindow": staticmethod(lambda h, rel: None),
             "GetWindowLongW": staticmethod(lambda h, i: 0), "IsIconic": staticmethod(lambda h: False),
             "GetWindowThreadProcessId": staticmethod(set_pid),
@@ -115,6 +125,7 @@ class _Shell:
         monkeypatch.setattr(window, "client_rect", lambda h: Rect(0, 0, 1280, 720))
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="listing windows (EnumWindows) is Windows-only")
 def test_a_store_apps_frame_is_listed_as_the_app_inside_it(monkeypatch):
     _Shell(monkeypatch)
     found = {w.hwnd: w for w in window.find_windows()}
@@ -123,6 +134,49 @@ def test_a_store_apps_frame_is_listed_as_the_app_inside_it(monkeypatch):
     assert found[400].app == "Xbox app" and found[600].exe == "storegame.exe"
     assert [w.hwnd for w in window.find_windows()][-1] == 600  # known apps first
     assert pick("xbox").hwnd in (100, 400)
+    left: dict = {}
+    window.find_windows(left)
+    assert left == {}  # every frame was listed by EnumWindows: nothing in full screen
+
+
+class _FullScreenShell(_Shell):
+    """The Xbox app in full screen (Shift+Win+Enter, or its own button): its frame is only found by FindWindowEx."""
+    TOP = {
+        100: ("applicationframehost.exe", "Xbox", [(101, "Windows.UI.Core.CoreWindow", "xboxpcapp.exe")]),
+        300: ("applicationframehost.exe", "Suspended app", []),
+        500: ("explorer.exe", "Documents", []),
+        600: ("applicationframehost.exe", "Store game", [(602, "Windows.UI.Core.CoreWindow", "storegame.exe")]),
+    }
+    IMMERSIVE = {100, 300, 600}
+    AUMID = {100: "Microsoft.GamingApp_8wekyb3d8bbwe!Microsoft.Xbox.AppL", 300: "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"}
+
+
+class _SwitchedAwayShell(_FullScreenShell):
+    """...and then switched away from (to the launcher): the frame stays in full screen, but the shell suspends the
+    app and takes its window out of the frame, so only the frame's AppUserModelID says which app it is."""
+    TOP = {**_FullScreenShell.TOP, 100: ("applicationframehost.exe", "Xbox", [])}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="listing windows (EnumWindows) is Windows-only")
+@pytest.mark.parametrize("shell", [_FullScreenShell, _SwitchedAwayShell])
+def test_a_store_app_in_full_screen_is_noted_not_listed(monkeypatch, shell):
+    shell(monkeypatch)
+    left: dict = {}
+    assert window.find_windows(left) == []
+    # Only streaming apps are noted (never another app, here the Store game), and a suspended app that isn't one
+    # (the Calculator) isn't either
+    assert left == {"xboxpcapp.exe": {window.FULL_SCREEN}}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="listing windows (EnumWindows) is Windows-only")
+def test_play_says_to_leave_full_screen(monkeypatch):
+    _FullScreenShell(monkeypatch)
+    with pytest.raises(RuntimeError, match="the Xbox app is in full screen.*Shift\\+Win\\+Enter"):
+        window.open_window("hwnd:100|exe:xboxpcapp.exe")
+    with pytest.raises(RuntimeError, match="the Xbox app is in full screen"):
+        window.open_window("exe:XboxPcAppCE")  # the Xbox app's other program: the same app
+    with pytest.raises(RuntimeError, match="no app window matches"):  # another app was asked for
+        window.open_window("exe:moonlight.exe")
 
 
 # ----------------------------------------------------------------------------- the source
@@ -454,13 +508,14 @@ def test_to_bgr_scales_on_the_gpu_or_cpu():
 
 def test_open_window_scales_to_the_streams_size(monkeypatch):
     _Desk(monkeypatch)
-    monkeypatch.setattr(window, "pick", lambda q: WINDOWS[0])
+    monkeypatch.setattr(window, "find_windows", lambda left_out=None: list(WINDOWS))
     monkeypatch.setattr(window, "_cuda", lambda: False)
     src = window.open_window("ps-remote-play")
     assert (src.w, src.h) == window.SIZE == (1920, 1080)
 
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="listing windows (EnumWindows) is Windows-only")
 def test_a_running_streaming_app_left_off_the_list_says_why(monkeypatch):
     shell = _Shell(monkeypatch)
     u32 = window._api()[0]

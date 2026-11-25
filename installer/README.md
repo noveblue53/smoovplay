@@ -95,7 +95,7 @@ Every step can run again: **Retry** after a failure, or **Repair** in Help later
    * `app\`: run.py, framegen and the RIFE weights.
    * `chiaki\`: chiaki-ng with the frame tap, its licences and the patch source.
    * `SmoovPlay.exe`.
-2. Downloads the Python 3.12.10 embeddable package from python.org, verifies its SHA-256, and sets its `._pth` file to see `Lib\site-packages` and `..\..\app`. It then installs pip with `get-pip.py`.
+2. Downloads the Python 3.12.10 embeddable package from python.org, verifies its SHA-256, and sets its `._pth` file to see `Lib\site-packages` and `..\..\app`. It then installs pip with `get-pip.py`. Every Python it starts runs with `-s` and `PYTHONNOUSERSITE=1`, so the user site-packages of a regular Python 3.12 (`%APPDATA%\Python\Python312`) never joins in: isolated mode alone doesn't leave it out.
 3. Runs `pip install -r app\requirements-runtime.txt` with pinned versions, about 5 GB:
    * Sources: pypi.org, plus download.pytorch.org for CUDA PyTorch and pypi.nvidia.com for TensorRT's wheels.
    * setuptools and wheel go in first, and pip runs with `--no-build-isolation`, because pip's isolated build doesn't work in the embeddable Python.
