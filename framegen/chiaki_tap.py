@@ -21,7 +21,6 @@ from __future__ import annotations
 import csv
 import ctypes
 import mmap
-import queue
 import struct
 import sys
 import tempfile
@@ -32,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .io import Tick
+from .io import LatestFrameMailbox, Tick
 from .streamcheck import StreamCheck
 from .sync import CAPTURE_LOCK
 
@@ -747,7 +746,7 @@ class ChiakiSource:
         self.hdr_stream = h.codec == 2  # chiaki-ng's H.265 HDR codec: 10-bit HDR10 from the PS5
         self.convert = None  # set_hdr(): a framegen.hdr.StreamConverter, when SmoovPlay's HDR setting is on
         self._hdr_told = False
-        self.q: queue.Queue = queue.Queue(maxsize=3)
+        self.q: LatestFrameMailbox = LatestFrameMailbox()
         self.dropped = 0  # decoded frames dropped because the pipeline fell behind
         self.skipped = 0  # stream frames never decoded (ring overrun or waiting for a keyframe)
         self.idr_requests = 0
@@ -820,7 +819,7 @@ class ChiakiSource:
             if not h.live:
                 if decoded:  # the stream we were showing ended
                     print("[tap] the app stopped sending frames" if self.app else "[chiaki] stream ended")
-                    self.q.put(None)
+                    self.q.close()
                     return
                 self.tap.wait(0.25)  # not started yet, or being reconnected
                 continue
@@ -828,7 +827,7 @@ class ChiakiSource:
                 session, codec = h.session, CODECS.get(h.codec, "h264")
                 if (h.width, h.height) != (self.w, self.h):
                     print(f"{self.tag} stream size changed to {h.width}x{h.height}; restart run.py", file=sys.stderr)
-                    self.q.put(None)
+                    self.q.close()
                     return
                 dec, params, pending, decoded, dpb_held, damaged_left, errors, held = None, b"", b"", False, 0, 0, 0, -1
                 sizes = SizeRepeatDetector()
@@ -950,12 +949,8 @@ class ChiakiSource:
                                    "size_new": size_new, "size_ref": sizes.ref, "big": sizes.big})
                 if self.test is not None and (tick := self.test(tick)) is None:
                     continue
-                try:
-                    self.q.put_nowait(tick)
-                except queue.Full:
-                    self.q.get_nowait()
+                if self.q.put(tick):
                     self.dropped += 1
-                    self.q.put_nowait(tick)
             damaged_left = max(0, damaged_left - 1)
 
     def _image(self, fr):
@@ -1051,11 +1046,7 @@ class ChiakiSource:
         if on:
             self._go.clear()
             return
-        while True:  # frames from before the restart are stale by now
-            try:
-                self.q.get_nowait()
-            except queue.Empty:
-                break
+        self.q.clear()  # frames from before the restart are stale by now
         self._go.set()
 
     def why(self) -> str:
@@ -1081,6 +1072,7 @@ class ChiakiSource:
         if not self._hdr_told:  # nobody said what to do with HDR: as with the setting off
             self.set_hdr(None)
         self.dropped = 0  # frames dropped while RIFE was loading don't count
+        self.q.dropped = 0
         self._go.set()  # the pipeline is ready: start decoding
         from .io import queue_ticks
         yield from queue_ticks(self.q, "the PS5", self.why)
@@ -1100,6 +1092,7 @@ class ChiakiSource:
 
     def close(self) -> None:
         self._stop = True
+        self.q.close()
         if self._log is not None:
             self._log[0].close()
         try:

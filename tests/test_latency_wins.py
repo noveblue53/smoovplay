@@ -244,3 +244,124 @@ def test_decoder_low_delay_zero_frame_dpb():
     outs = [len(dec.decode(av.Packet(b))) for b in pkts]
     assert outs == [1, 1, 1, 1, 1, 1], f"expected 0-frame DPB (1 frame per packet), got {outs}"
     assert not dec.has_b_frames
+
+
+def _mailbox_tick(seq: int) -> Tick:
+    return Tick(np.zeros((2, 2, 3), np.uint8), time.perf_counter(), 0, extra={"seq": seq})
+
+
+def test_mailbox_overwrites_and_returns_newest_immediately():
+    from framegen.io import LatestFrameMailbox, WAIT_POLL_S
+
+    mailbox = LatestFrameMailbox()
+    results = [mailbox.put(_mailbox_tick(i)) for i in range(5)]
+
+    assert results == [False, True, True, True, True]
+    assert mailbox.dropped == 4
+
+    t0 = time.perf_counter()
+    got = mailbox.get(timeout=WAIT_POLL_S)
+    elapsed = time.perf_counter() - t0
+
+    assert got is not None
+    assert got.extra["seq"] == 4
+    assert elapsed < WAIT_POLL_S
+
+
+def test_mailbox_queue_ticks_delivers_newest_and_waiting():
+    import threading
+    from framegen.io import LatestFrameMailbox, WAIT_POLL_S, Waiting, queue_ticks
+
+    mailbox = LatestFrameMailbox()
+    for i in range(5):
+        mailbox.put(_mailbox_tick(i))
+    mailbox.close()
+
+    got = list(queue_ticks(mailbox, "the PS5"))
+    assert len(got) == 1
+    assert isinstance(got[0], Tick)
+    assert got[0].index == 0
+    assert got[0].extra["seq"] == 4
+    assert mailbox.dropped == 4
+
+    mailbox2 = LatestFrameMailbox()
+
+    def feed():
+        time.sleep(WAIT_POLL_S * 2.2)
+        mailbox2.put(_mailbox_tick(42))
+        mailbox2.close()
+
+    threading.Thread(target=feed, daemon=True).start()
+    items = list(queue_ticks(mailbox2, "the PS5"))
+    waits = [x for x in items if isinstance(x, Waiting)]
+    ticks = [x for x in items if isinstance(x, Tick)]
+    assert len(waits) >= 1
+    assert len(ticks) == 1
+    assert ticks[0].index == 0
+    assert ticks[0].extra["seq"] == 42
+
+
+def test_mailbox_clear_and_chiaki_hold_false():
+    import queue
+    import threading
+    from framegen.io import LatestFrameMailbox, WAIT_POLL_S
+
+    mailbox = LatestFrameMailbox()
+    mailbox.put(_mailbox_tick(0))
+    mailbox.put(_mailbox_tick(1))
+    assert mailbox.dropped == 1
+
+    mailbox.clear()
+    with pytest.raises(queue.Empty):
+        mailbox.get(timeout=0.01)
+
+    mailbox.put(_mailbox_tick(2))
+    got = mailbox.get(timeout=WAIT_POLL_S)
+    assert got.extra["seq"] == 2
+    assert mailbox.dropped == 1
+
+    src = chiaki_tap.ChiakiSource.__new__(chiaki_tap.ChiakiSource)
+    src._go = threading.Event()
+    src._go.set()
+    src.q = LatestFrameMailbox()
+
+    src.hold(True)
+    assert not src._go.is_set()
+    src.q.put(_mailbox_tick(10))
+    src.hold(False)
+    assert src._go.is_set()
+    with pytest.raises(queue.Empty):
+        src.q.get(timeout=0.01)
+
+
+def test_mailbox_concurrent_producer_consumer():
+    import queue
+    import threading
+    from framegen.io import LatestFrameMailbox, WAIT_POLL_S
+
+    mailbox = LatestFrameMailbox()
+    total = 50
+
+    def producer():
+        for i in range(total):
+            mailbox.put(_mailbox_tick(i))
+            time.sleep(0.001)
+        mailbox.close()
+
+    t = threading.Thread(target=producer, daemon=True)
+    t.start()
+
+    received: list[int] = []
+    while True:
+        try:
+            item = mailbox.get(timeout=WAIT_POLL_S)
+        except queue.Empty:
+            continue
+        if item is None:
+            break
+        received.append(item.extra["seq"])
+
+    t.join(timeout=2.0)
+    assert received == sorted(received)
+    assert len(set(received)) == len(received)
+    assert len(received) + mailbox.dropped == total

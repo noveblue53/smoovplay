@@ -55,7 +55,71 @@ class Waiting(NamedTuple):
 WAIT_POLL_S = 0.1  # how long a source waits for a frame before saying so
 
 
-def queue_ticks(q: queue.Queue, what: str, why=None):
+class LatestFrameMailbox:
+    """Thread-safe 1-slot latest-frame mailbox.
+
+    A producer overwrites any unconsumed slot with the newest frame and increments `dropped`,
+    so a consumer always receives the latest decoded frame without standing FIFO queue latency.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._slot = None
+        self._has_item = False
+        self._closed = False
+        self.dropped = 0
+
+    def put(self, item) -> bool:
+        """Store `item` as the latest frame. Returns True if an unconsumed frame was overwritten."""
+        if item is None:
+            self.close()
+            return False
+        with self._cond:
+            if self._closed:
+                return False
+            overwrote = self._has_item
+            if overwrote:
+                self.dropped += 1
+            self._slot = item
+            self._has_item = True
+            self._cond.notify()
+            return overwrote
+
+    def get(self, timeout: float | None = None):
+        """Pop and return the latest frame, None if closed and empty, or raise queue.Empty on timeout."""
+        with self._cond:
+            if not self._has_item and not self._closed:
+                if timeout is None:
+                    while not self._has_item and not self._closed:
+                        self._cond.wait()
+                else:
+                    deadline = time.monotonic() + max(0.0, timeout)
+                    while not self._has_item and not self._closed:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0.0:
+                            raise queue.Empty
+                        self._cond.wait(remaining)
+            if self._has_item:
+                item = self._slot
+                self._slot = None
+                self._has_item = False
+                return item
+            return None
+
+    def clear(self) -> None:
+        """Discard any unconsumed frame without counting it as dropped."""
+        with self._cond:
+            self._slot = None
+            self._has_item = False
+
+    def close(self) -> None:
+        """Mark the mailbox closed and wake any waiting consumer."""
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+
+def queue_ticks(q: queue.Queue | LatestFrameMailbox, what: str, why=None):
     """A live source's ticks, as its reader thread puts them in `q` (None ends them), numbered from 0, with a
     Waiting in between whenever none has come for WAIT_POLL_S. why: () -> the source's hint for the Waiting."""
     i, last = 0, time.perf_counter()
