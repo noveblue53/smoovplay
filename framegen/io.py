@@ -830,9 +830,14 @@ class GLWindowSink:
             self._hint_next = now + 20.0
             self.toast(self.KEYS_HINT, 3.0 if self.hotkeys is None else 6.0)
 
+    def _vsr_rcas(self) -> float | None:
+        s = getattr(self.settings, "vsr_sharpness", "off")
+        return float(s) if self.fsr is not None and s != "off" else None
+
     def _name(self, mode: str) -> str:
         if mode == "vsr":
-            return f"RTX VSR q{self.vsr.quality if self.vsr is not None else self.settings.vsr_quality}"
+            q = self.vsr.quality if self.vsr is not None else self.settings.vsr_quality
+            return f"RTX VSR q{q}" + (" + RCAS" if self._vsr_rcas() is not None else "")
         return self.NAMES[mode]
 
     def _vsr_ready(self) -> bool:
@@ -1464,7 +1469,13 @@ class GLWindowSink:
                 self.fsr.draw(self.tex, self.w, self.h, fbo, 0, 0, dw, dh)
                 flip_in = True  # (FSR draws upright)
             elif upscale and mode == "vsr":
-                src, flip_in = self._vsr_render(dw, dh, frame if direct_vsr else None)[0], False
+                if (sharp := self._vsr_rcas()) is not None:
+                    vsr_tex = self._vsr_render(dw, dh, frame if direct_vsr else None)[0]
+                    src, fbo = self.look_gl.input_target(dw, dh)
+                    self.fsr.sharpen(vsr_tex, fbo, 0, 0, dw, dh, sharp)
+                    flip_in = True
+                else:
+                    src, flip_in = self._vsr_render(dw, dh, frame if direct_vsr else None)[0], False
             else:
                 src, flip_in = self.tex, False  # the look's first pass resizes it
             self.look_gl.draw(plan, src, flip_in, target, x0, y0, dw, dh, True, self._frame_no)
@@ -1474,7 +1485,8 @@ class GLWindowSink:
             self.fsr.draw(self.tex, self.w, self.h, target, x0, y0, dw, dh)
             GL.glViewport(0, 0, fw, fh)
         elif upscale and mode == "vsr":
-            self._vsr_draw(x0, y0, dw, dh, frame if direct_vsr else None)
+            self._vsr_draw(target, x0, y0, dw, dh, frame if direct_vsr else None)
+            GL.glViewport(0, 0, fw, fh)
         else:
             GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.fbo)
             # Image row 0 is the top; GL row 0 is the bottom, so blit with destination Y flipped.
@@ -1502,10 +1514,14 @@ class GLWindowSink:
         cmd, self.cmd = self.cmd, None
         return cmd
 
-    def _vsr_draw(self, x0: int, y0: int, dw: int, dh: int, frame=None) -> None:
-        """RTX VSR from the staged RGBA frame (or direct frame) straight into a window-sized GL texture, then a 1:1 blit."""
+    def _vsr_draw(self, target: int, x0: int, y0: int, dw: int, dh: int, frame=None) -> None:
+        """RTX VSR from the staged RGBA frame (or direct frame) straight into a window-sized GL texture, then either
+        an RCAS sharpening pass or a 1:1 blit."""
         GL = self.GL
-        fbo = self._vsr_render(dw, dh, frame)[1]
+        tex, fbo = self._vsr_render(dw, dh, frame)
+        if (sharp := self._vsr_rcas()) is not None:
+            self.fsr.sharpen(tex, target, x0, y0, dw, dh, sharp)
+            return
         GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, fbo)
         GL.glBlitFramebuffer(0, 0, dw, dh, x0, y0 + dh, x0 + dw, y0, GL.GL_COLOR_BUFFER_BIT, GL.GL_NEAREST)
 

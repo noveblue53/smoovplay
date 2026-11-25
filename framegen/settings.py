@@ -200,6 +200,12 @@ SPECS: tuple[Spec, ...] = (
               "for clean video.",
          impact={"picture": "Higher is cleaner and sharper.",
                  "speed": "Each step up asks more of the GPU."}),
+    Spec("vsr_sharpness", "RTX VSR sharpening (RCAS)", ("off", 0.0, 0.25, 0.5, 1.0), "off",
+         {"off": "Off", 0.0: "Max", 0.25: "High", 0.5: "Medium", 1.0: "Low"},
+         group="Picture", applies=("scaler", ("vsr",)),
+         help="Runs AMD FSR 1's contrast-adaptive sharpening (RCAS, ~0.3 ms) after RTX VSR to restore crispness to "
+              "distant edges and fine textures without amplifying compression blocks.",
+         impact={"picture": "Crisper distant edges after RTX VSR.", "speed": "About 0.3 ms a frame."}),
     # framegen/hdr.py. Off by default, and then nothing changes: an HDR stream comes out washed out, and SmoovPlay says
     # so. "hdr10" needs the DXGI presentation (NVIDIA) and Windows' HDR; without them run.py uses "sdr" for the session.
     Spec("hdr", "HDR", ("off", "sdr", "hdr10"), "off",
