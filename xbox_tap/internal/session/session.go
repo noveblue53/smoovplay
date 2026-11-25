@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 
@@ -448,7 +449,17 @@ func newPeerConnection() (*webrtc.PeerConnection, error) {
 	if err := m.RegisterDefaultCodecs(); err != nil {
 		return nil, err
 	}
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
+	ir := &interceptor.Registry{}
+	if err := webrtc.RegisterDefaultInterceptors(m, ir); err != nil {
+		return nil, err
+	}
+	var se webrtc.SettingEngine
+	se.SetReceiveMTU(8192)
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(m),
+		webrtc.WithInterceptorRegistry(ir),
+		webrtc.WithSettingEngine(se),
+	)
 	return api.NewPeerConnection(webrtc.Configuration{
 		BundlePolicy:  webrtc.BundlePolicyMaxBundle,
 		RTCPMuxPolicy: webrtc.RTCPMuxPolicyRequire,

@@ -25,20 +25,21 @@ type Frame struct {
 
 // Depacketizer reassembles H.264 RTP packets into Annex-B frames with zero buffering delay.
 type Depacketizer struct {
-	pkt          codecs.H264Packet
-	buf          bytes.Buffer
-	curTS        uint32
-	hasTS        bool
-	hasSeq       bool
-	lastSeq      uint16
-	lastEmitTS   uint32
-	hasEmitTS    bool
-	corrupted    bool
-	hasKeyframe  bool
-	spsWidth     int
-	spsHeight    int
-	lastSPS      []byte
-	fps          int
+	pkt         codecs.H264Packet
+	buf         bytes.Buffer
+	out         []byte // reused backing slice for emitted Frame.Data
+	curTS       uint32
+	hasTS       bool
+	hasSeq      bool
+	lastSeq     uint16
+	lastEmitTS  uint32
+	hasEmitTS   bool
+	corrupted   bool
+	hasKeyframe bool
+	spsWidth    int
+	spsHeight   int
+	lastSPS     []byte
+	fps         int
 }
 
 // NewDepacketizer creates a zero-jitter-buffer H.264 depacketizer.
@@ -51,17 +52,28 @@ func NewDepacketizer(fps int) *Depacketizer {
 
 // Push feeds one RTP packet. Returns a completed Frame as soon as the RTP marker bit
 // (or a timestamp change) completes an access unit, or nil if more fragments are coming.
+// The returned Frame.Data aliases an internal buffer reused across frames; callers must
+// consume or copy it before calling Push again.
 func (d *Depacketizer) Push(p *rtp.Packet) *Frame {
 	if p == nil || len(p.Payload) == 0 {
 		return nil
 	}
 
+	// Drop exact duplicate RTP packets before they cause false corruption or duplicate NALU bytes.
+	if d.hasSeq && p.SequenceNumber == d.lastSeq {
+		return nil
+	}
+
 	var emitted *Frame
 	// If timestamp changed before we saw a marker bit (lost last packet of previous frame),
-	// flush the previous access unit marked corrupted.
-	if d.hasTS && p.Timestamp != d.curTS && d.buf.Len() > 0 {
-		d.corrupted = true
-		emitted = d.flush(d.curTS)
+	// flush the previous access unit marked corrupted and clear any stale incomplete FU-A state.
+	if d.hasTS && p.Timestamp != d.curTS {
+		if d.buf.Len() > 0 {
+			d.corrupted = true
+			emitted = d.flush(d.curTS)
+		} else {
+			d.pkt = codecs.H264Packet{}
+		}
 	}
 
 	if d.hasSeq {
@@ -119,16 +131,16 @@ func (d *Depacketizer) appendNALUs(data []byte) {
 }
 
 func (d *Depacketizer) flush(ts uint32) *Frame {
-	raw := make([]byte, d.buf.Len())
-	copy(raw, d.buf.Bytes())
+	d.out = append(d.out[:0], d.buf.Bytes()...)
 	d.buf.Reset()
+	d.pkt = codecs.H264Packet{}
 
 	lost := d.inferLost(ts)
 	if d.corrupted && lost == 0 {
 		lost = 1
 	}
 	f := &Frame{
-		Data:       raw,
+		Data:       d.out,
 		Timestamp:  ts,
 		Keyframe:   d.hasKeyframe,
 		FramesLost: lost,
