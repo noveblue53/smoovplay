@@ -28,7 +28,7 @@ const (
 	xblUserURL    = "https://user.auth.xboxlive.com/user/authenticate"
 	xstsAuthURL   = "https://xsts.auth.xboxlive.com/xsts/authorize"
 
-	xhomeLoginHost   = "xhome.gssv-play-prodz.xboxlive.com"
+	xhomeLoginHost   = "xhome.gssv-play-prod.xboxlive.com"
 	xgpuwebLoginHost = "xgpuweb.gssv-play-prod.xboxlive.com"
 	f2pLoginHost     = "xgpuwebf2p.gssv-play-prod.xboxlive.com"
 )
