@@ -82,6 +82,9 @@ func (w *Writer) Begin(codec, width, height, maxFPS, features uint32) {
 	}
 	// Mark not-live while updating header fields.
 	binary.LittleEndian.PutUint32(w.mem[0:4], 0)
+	if prev := binary.LittleEndian.Uint32(w.mem[44:48]); prev >= w.session {
+		w.session = prev
+	}
 	w.session++
 	w.writeSeq = 0
 

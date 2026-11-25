@@ -58,7 +58,7 @@ func (w *Writer) openPlatform() error {
 		windows.InvalidHandle, nil, windows.PAGE_READWRITE,
 		uint32(uint64(TotalSize)>>32), uint32(TotalSize), namePtr,
 	)
-	if err != nil {
+	if err != nil && err != windows.ERROR_ALREADY_EXISTS {
 		return fmt.Errorf("CreateFileMapping(%s): %w", w.name, err)
 	}
 	addr, err := windows.MapViewOfFile(hMap, windows.FILE_MAP_READ | windows.FILE_MAP_WRITE, 0, 0, TotalSize)
@@ -74,7 +74,7 @@ func (w *Writer) openPlatform() error {
 		return err
 	}
 	hEvent, err := windows.CreateEvent(nil, 0, 0, evPtr)
-	if err != nil {
+	if err != nil && err != windows.ERROR_ALREADY_EXISTS {
 		_ = windows.UnmapViewOfFile(addr)
 		_ = windows.CloseHandle(hMap)
 		return fmt.Errorf("CreateEvent(%s): %w", w.eventName, err)
@@ -87,7 +87,7 @@ func (w *Writer) openPlatform() error {
 		if hm, hmErr := windows.CreateFileMapping(
 			windows.InvalidHandle, nil, windows.PAGE_READWRITE,
 			0, AudioTotalSize, aPtr,
-		); hmErr == nil {
+		); (hmErr == nil || hmErr == windows.ERROR_ALREADY_EXISTS) && hm != 0 {
 			if aa, aaErr := windows.MapViewOfFile(hm, windows.FILE_MAP_READ | windows.FILE_MAP_WRITE, 0, 0, AudioTotalSize); aaErr == nil {
 				hAudioMap = hm
 				audioAddr = aa

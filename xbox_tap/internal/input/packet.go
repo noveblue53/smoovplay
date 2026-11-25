@@ -77,6 +77,41 @@ func EncodeClientMetadata(seq uint32, timestampMs float64, maxTouchPoints uint8)
 	return buf
 }
 
+// MetadataFrame reports video frame arrival/render timing back to the Xbox on dcInput (ReportMetadata).
+type MetadataFrame struct {
+	ServerDataKey uint32 // RTP timestamp of the video frame
+	ArrivalMs     uint32 // ms since session start
+	SubmittedMs   uint32
+	DecodedMs     uint32
+	RenderedMs    uint32
+	PacketTimeMs  uint32
+	NowMs         uint32
+}
+
+// EncodeMetadataPacket builds a binary ReportMetadata packet (header + 1 + 28*N bytes).
+func EncodeMetadataPacket(seq uint32, timestampMs float64, frames []MetadataFrame) []byte {
+	n := len(frames)
+	if n > 255 {
+		n = 255
+	}
+	buf := make([]byte, headerSize+1+n*28)
+	writeHeader(buf, ReportMetadata, seq, timestampMs)
+	buf[headerSize] = uint8(n)
+	off := headerSize + 1
+	for i := 0; i < n; i++ {
+		f := frames[i]
+		binary.LittleEndian.PutUint32(buf[off:off+4], f.ServerDataKey)
+		binary.LittleEndian.PutUint32(buf[off+4:off+8], f.ArrivalMs)
+		binary.LittleEndian.PutUint32(buf[off+8:off+12], f.SubmittedMs)
+		binary.LittleEndian.PutUint32(buf[off+12:off+16], f.DecodedMs)
+		binary.LittleEndian.PutUint32(buf[off+16:off+20], f.RenderedMs)
+		binary.LittleEndian.PutUint32(buf[off+20:off+24], f.PacketTimeMs)
+		binary.LittleEndian.PutUint32(buf[off+24:off+28], f.NowMs)
+		off += 28
+	}
+	return buf
+}
+
 // EncodeGamepadPacket builds a binary gamepad report packet (header + 1 + 23*N bytes).
 func EncodeGamepadPacket(seq uint32, timestampMs float64, frames []GamepadState) []byte {
 	if len(frames) == 0 {

@@ -92,3 +92,21 @@ func TestMapChiakiButtons(t *testing.T) {
 		t.Fatalf("zero -> 0x%x, want 0", got)
 	}
 }
+
+func TestEncodeMetadataPacket(t *testing.T) {
+	frames := []MetadataFrame{
+		{ServerDataKey: 90000, ArrivalMs: 10, SubmittedMs: 11, DecodedMs: 12, RenderedMs: 13, PacketTimeMs: 14, NowMs: 15},
+		{ServerDataKey: 91500, ArrivalMs: 26, SubmittedMs: 27, DecodedMs: 28, RenderedMs: 29, PacketTimeMs: 30, NowMs: 31},
+	}
+	pkt := EncodeMetadataPacket(7, 31.0, frames)
+	wantLen := headerSize + 1 + len(frames)*28
+	if len(pkt) != wantLen {
+		t.Fatalf("len(pkt) = %d, want %d", len(pkt), wantLen)
+	}
+	if got := uint16(pkt[0]) | uint16(pkt[1])<<8; got != ReportMetadata {
+		t.Fatalf("reportType = %d, want %d", got, ReportMetadata)
+	}
+	if pkt[headerSize] != 2 {
+		t.Fatalf("frame count = %d, want 2", pkt[headerSize])
+	}
+}

@@ -116,9 +116,9 @@ func Run(ctx context.Context, client *gssv.Client, cfg Config) error {
 	}
 	defer pc.Close()
 
-	// RecvOnly video & audio transceivers (matches Xbox WebRTC expectations).
+	// SendRecv audio & RecvOnly video transceivers (matches Xbox WebRTC expectations).
 	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionRecvonly,
+		Direction: webrtc.RTPTransceiverDirectionSendrecv,
 	}); err != nil {
 		return err
 	}
@@ -150,6 +150,8 @@ func Run(ctx context.Context, client *gssv.Client, cfg Config) error {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 
+	sessionStart := time.Now()
+	var inputSeq atomic.Uint32
 	var videoSSRC atomic.Uint32
 	var videoFrames atomic.Uint64
 	var videoLost atomic.Uint64
@@ -166,29 +168,23 @@ func Run(ctx context.Context, client *gssv.Client, cfg Config) error {
 		})
 	}
 
-	// Control channel handshake
+	// Control channel
 	dcControl.OnOpen(func() {
 		log.Printf("[xbox-tap] control channel open")
-		sendControlJSON(dcControl, map[string]any{
-			"message":   "authorizationRequest",
-			"accessKey": controlAccessKey,
-		})
-		sendControlJSON(dcControl, map[string]any{
-			"message":      "gamepadChanged",
-			"gamepadIndex": 0,
-			"wasAdded":     true,
-		})
-		sendControlJSON(dcControl, map[string]any{
-			"message":    "VideoPreference",
-			"type":       "VideoPreference",
-			"resolution": map[string]int{"width": cfg.Width, "height": cfg.Height},
-			"dimensions": map[string]int{"width": cfg.Width, "height": cfg.Height},
-			"maxFPS":     cfg.FPS,
-		})
-		requestKeyframe()
+	})
+	dcControl.OnMessage(func(msg webrtc.DataChannelMessage) {
+		s := string(msg.Data)
+		if len(s) > 240 {
+			s = s[:240]
+		}
+		log.Printf("[xbox-tap] control msg: %s", s)
+	})
+	dcControl.OnClose(func() {
+		log.Printf("[xbox-tap] control channel closed")
 	})
 
-	// Message channel handshake
+	// Message channel handshake: on HandshakeAck, send control auth, start input, and send message config.
+	var handshakeOnce sync.Once
 	dcMessage.OnOpen(func() {
 		log.Printf("[xbox-tap] message channel open")
 		sendControlJSON(dcMessage, map[string]any{
@@ -199,24 +195,69 @@ func Run(ctx context.Context, client *gssv.Client, cfg Config) error {
 		})
 	})
 	dcMessage.OnMessage(func(msg webrtc.DataChannelMessage) {
+		s := string(msg.Data)
+		if len(s) > 240 {
+			s = s[:240]
+		}
+		log.Printf("[xbox-tap] message msg: %s", s)
 		var env map[string]any
 		if json.Unmarshal(msg.Data, &env) != nil {
 			return
 		}
 		if env["type"] == "HandshakeAck" {
-			sendMessageHandshakeConfig(dcMessage, cfg.Width, cfg.Height)
+			handshakeOnce.Do(func() {
+				log.Printf("[xbox-tap] HandshakeAck received -> starting control, input, and message config")
+				go func() {
+					deadline := time.Now().Add(2 * time.Second)
+					for (dcControl.ReadyState() != webrtc.DataChannelStateOpen || dcInput.ReadyState() != webrtc.DataChannelStateOpen) && time.Now().Before(deadline) {
+						if runCtx.Err() != nil {
+							return
+						}
+						time.Sleep(10 * time.Millisecond)
+					}
+					sendControlJSON(dcControl, map[string]any{
+						"message":   "authorizationRequest",
+						"accessKey": controlAccessKey,
+					})
+					sendControlJSON(dcControl, map[string]any{
+						"message":      "gamepadChanged",
+						"gamepadIndex": 0,
+						"wasAdded":     true,
+					})
+					sendControlJSON(dcControl, map[string]any{
+						"message":      "gamepadChanged",
+						"gamepadIndex": 0,
+						"wasAdded":     false,
+					})
+					requestKeyframe()
+					if dcInput.ReadyState() == webrtc.DataChannelStateOpen {
+						_ = dcInput.Send(input.EncodeClientMetadata(0, 0, 0))
+					}
+					go runInputLoop(runCtx, dcInput, dcControl, tap, sessionStart, &inputSeq)
+					sendMessageHandshakeConfig(dcMessage, cfg.Width, cfg.Height)
+				}()
+			})
 		}
 	})
+	dcMessage.OnClose(func() {
+		log.Printf("[xbox-tap] message channel closed")
+	})
 
-	// Input channel: 250 Hz XInput polling (immediate on change, 125 Hz idle heartbeat) + rumble feedback + FEATURE_PRESS delay test
+	// Input channel: 250 Hz XInput polling (started after HandshakeAck) + rumble feedback + ServerMetadata
 	rumble := newRumbleController(input.SetRumble)
 	defer rumble.stopAll()
 
 	dcInput.OnOpen(func() {
-		log.Printf("[xbox-tap] input channel open (250 Hz XInput polling)")
-		go runInputLoop(runCtx, dcInput, dcControl, tap)
+		log.Printf("[xbox-tap] input channel open")
+	})
+	dcInput.OnClose(func() {
+		log.Printf("[xbox-tap] input channel closed")
 	})
 	dcInput.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if w, h, ok := input.ParseServerMetadata(msg.Data); ok {
+			log.Printf("[xbox-tap] server video metadata: %dx%d", w, h)
+			return
+		}
 		if vib, ok := input.ParseVibration(msg.Data); ok {
 			rumble.apply(vib)
 		}
@@ -237,6 +278,7 @@ func Run(ctx context.Context, client *gssv.Client, cfg Config) error {
 				if audioPlayer != nil {
 					feats |= frametap.FeatureAudioDelay | frametap.FeatureAudioTap
 				}
+				var metaBatch []input.MetadataFrame
 				for {
 					pkt, _, err := track.ReadRTP()
 					if err != nil {
@@ -248,6 +290,22 @@ func Run(ctx context.Context, client *gssv.Client, cfg Config) error {
 					frame := depacketizer.Push(pkt)
 					if frame == nil {
 						continue
+					}
+					nowMs := uint32(time.Since(sessionStart).Milliseconds())
+					metaBatch = append(metaBatch, input.MetadataFrame{
+						ServerDataKey: pkt.Timestamp,
+						ArrivalMs:     nowMs,
+						SubmittedMs:   nowMs,
+						DecodedMs:     nowMs,
+						RenderedMs:    nowMs,
+						PacketTimeMs:  nowMs,
+						NowMs:         nowMs,
+					})
+					if len(metaBatch) >= 6 {
+						if dcInput.ReadyState() == webrtc.DataChannelStateOpen {
+							_ = dcInput.Send(input.EncodeMetadataPacket(inputSeq.Add(1), float64(nowMs), metaBatch))
+						}
+						metaBatch = metaBatch[:0]
 					}
 					if !started {
 						if !frame.Keyframe {
@@ -323,6 +381,9 @@ func Run(ctx context.Context, client *gssv.Client, cfg Config) error {
 		candMu.Unlock()
 	})
 
+	pc.OnICEConnectionStateChange(func(st webrtc.ICEConnectionState) {
+		log.Printf("[xbox-tap] ICE state: %s", st.String())
+	})
 	pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
 		log.Printf("[xbox-tap] WebRTC state: %s", st.String())
 		if st == webrtc.PeerConnectionStateFailed || st == webrtc.PeerConnectionStateClosed || st == webrtc.PeerConnectionStateDisconnected {
@@ -330,15 +391,16 @@ func Run(ctx context.Context, client *gssv.Client, cfg Config) error {
 		}
 	})
 
-	// Create SDP offer, prioritize H.264 High Profile + bitrate cap
+	// Create SDP offer; Pion v4 requires unmodified offer in SetLocalDescription,
+	// then we prioritize H.264 High Profile + bitrate cap on the outbound SDP sent to GSSV.
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		return fmt.Errorf("create offer: %w", err)
 	}
-	offer.SDP = gssv.PrioritizeH264AndBitrate(offer.SDP, cfg.MaxBitrateKbps)
 	if err := pc.SetLocalDescription(offer); err != nil {
 		return fmt.Errorf("set local description: %w", err)
 	}
+	outboundSDP := gssv.PrioritizeH264AndBitrate(offer.SDP, cfg.MaxBitrateKbps)
 
 	// Wait up to 3s for ICE gathering to collect local host/srflx candidates
 	select {
@@ -349,7 +411,7 @@ func Run(ctx context.Context, client *gssv.Client, cfg Config) error {
 	}
 
 	log.Printf("[xbox-tap] exchanging SDP...")
-	answerSDP, err := client.ExchangeSDP(runCtx, sessionPath, offer.SDP)
+	answerSDP, err := client.ExchangeSDP(runCtx, sessionPath, outboundSDP)
 	if err != nil {
 		return fmt.Errorf("exchange SDP: %w", err)
 	}
@@ -414,7 +476,11 @@ func Run(ctx context.Context, client *gssv.Client, cfg Config) error {
 					}
 				}
 			case <-keepTick.C:
-				_ = client.Keepalive(runCtx, sessionPath)
+				if err := client.Keepalive(runCtx, sessionPath); err != nil {
+					log.Printf("[xbox-tap] keepalive error: %v", err)
+				} else {
+					log.Printf("[xbox-tap] keepalive ok")
+				}
 			case now := <-statsC:
 				f := videoFrames.Load()
 				dt := now.Sub(lastStatsAt).Seconds()
@@ -491,8 +557,9 @@ func (s *syntheticPress) step(now time.Time) (uint16, bool) {
 }
 
 const (
-	inputPollInterval      = 4 * time.Millisecond // 250 Hz XInput + TakePressRequest polling
-	inputHeartbeatInterval = 8 * time.Millisecond // 125 Hz idle heartbeat
+	inputPollInterval          = 4 * time.Millisecond   // 250 Hz XInput + TakePressRequest polling
+	inputHeartbeatInterval     = 8 * time.Millisecond   // 125 Hz idle heartbeat
+	inputIdleKeepaliveInterval = 250 * time.Millisecond // keep dcInput alive when no PC gamepad is connected
 )
 
 // rumbleController serializes rumble updates per gamepad and ensures any new
@@ -566,7 +633,17 @@ type inputDispatcher struct {
 	takePressRequest func() (buttons uint32, holdMs uint32)
 	onPressSent      func()
 	onGamepadChanged func(index int, connected bool)
+	nextSeq          func() uint32
 	sendPacket       func(pkt []byte) error
+}
+
+func (d *inputDispatcher) allocSeq() uint32 {
+	if d.nextSeq != nil {
+		return d.nextSeq()
+	}
+	s := d.seq
+	d.seq++
+	return s
 }
 
 func (d *inputDispatcher) step(now time.Time) bool {
@@ -613,8 +690,7 @@ func (d *inputDispatcher) step(now time.Time) bool {
 	}
 
 	tsMs := float64(now.Sub(d.start).Milliseconds())
-	pkt := input.EncodeGamepadPacket(d.seq, tsMs, active)
-	d.seq++
+	pkt := input.EncodeGamepadPacket(d.allocSeq(), tsMs, active)
 	if err := d.sendPacket(pkt); err == nil {
 		d.lastSent = append(d.lastSent[:0], active...)
 		d.lastSentAt = now
@@ -638,21 +714,15 @@ func gamepadStatesEqual(a, b []input.GamepadState) bool {
 	return true
 }
 
-func runInputLoop(ctx context.Context, dcInput, dcControl *webrtc.DataChannel, tap *frametap.Writer) {
-	start := time.Now()
-	var seq uint32 = 1
-	// Send initial ClientMetadata packet once on open.
-	_ = dcInput.Send(input.EncodeClientMetadata(seq, 0, 1))
-	seq++
-
+func runInputLoop(ctx context.Context, dcInput, dcControl *webrtc.DataChannel, tap *frametap.Writer, start time.Time, inputSeq *atomic.Uint32) {
 	ticker := time.NewTicker(inputPollInterval) // 250 Hz
 	defer ticker.Stop()
 
 	disp := &inputDispatcher{
 		start:        start,
-		seq:          seq,
 		wasConnected: [4]bool{true, false, false, false},
 		pollGamepad:  input.PollGamepad,
+		nextSeq:      func() uint32 { return inputSeq.Add(1) },
 		onGamepadChanged: func(index int, connected bool) {
 			sendControlJSON(dcControl, map[string]any{
 				"message":      "gamepadChanged",
@@ -688,7 +758,7 @@ func sendControlJSON(dc *webrtc.DataChannel, v any) {
 	if err != nil {
 		return
 	}
-	_ = dc.SendText(string(b))
+	_ = dc.Send(b)
 }
 
 func sendMessageHandshakeConfig(dc *webrtc.DataChannel, width, height int) {
