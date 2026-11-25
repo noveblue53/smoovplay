@@ -165,12 +165,12 @@ def _eval_fused_nv12_formula_cpu(y_np: np.ndarray, uv_np: np.ndarray, colorspace
     """Exact NumPy float32 evaluation of _NV12_TO_BGR_CUDA_SRC for bit-level verification without a GPU."""
     h, w = y_np.shape
     uv_h, uv_w, _ = uv_np.shape
-    yo, ys, cs, c_bu, c_gu, c_gv, c_rv = [np.float32(x) for x in chiaki_tap._nv12_to_bgr_params(colorspace, color_range)]
+    yo, ys, cs, c_bu, c_gu, c_gv, c_rv = [np.float32(x) for x in chiaki_tap._nv12_to_bgr_params(colorspace, color_range, h)]
 
     rows = np.arange(h, dtype=np.float32)[:, None]
     cols = np.arange(w, dtype=np.float32)[None, :]
     src_y = np.clip((rows + np.float32(0.5)) * np.float32(uv_h / h) - np.float32(0.5), np.float32(0.0), np.float32(uv_h - 1))
-    src_x = np.clip((cols + np.float32(0.5)) * np.float32(uv_w / w) - np.float32(0.5), np.float32(0.0), np.float32(uv_w - 1))
+    src_x = np.clip(cols * np.float32(uv_w / w), np.float32(0.0), np.float32(uv_w - 1))
     y0 = src_y.astype(np.int32)
     x0 = src_x.astype(np.int32)
     y1 = np.minimum(y0 + 1, uv_h - 1)
@@ -220,6 +220,81 @@ def test_fused_nv12_kernel_returns_none_on_cpu_tensors():
     y = torch.zeros((16, 16), dtype=torch.uint8)
     uv = torch.zeros((8, 8, 2), dtype=torch.uint8)
     assert chiaki_tap._FUSED_NV12_KERNEL.launch(y, uv, 1, 1) is None
+
+
+def test_nv12_to_bgr_params_unspecified_colorspace_by_height():
+    """Unspecified colorspace (0 or 2) defaults to BT.709 at >=720p and BT.601 below 720p."""
+    bt709 = chiaki_tap._nv12_to_bgr_params(1, 1, 1080)
+    bt601 = chiaki_tap._nv12_to_bgr_params(5, 1, 480)
+    for cs in (0, 2):
+        assert chiaki_tap._nv12_to_bgr_params(cs, 1, 1080) == bt709
+        assert chiaki_tap._nv12_to_bgr_params(cs, 1, 720) == bt709
+        assert chiaki_tap._nv12_to_bgr_params(cs, 1, 480) == bt601
+    # Explicit tags must be respected regardless of height.
+    assert chiaki_tap._nv12_to_bgr_params(5, 1, 1080) == bt601
+    assert chiaki_tap._nv12_to_bgr_params(1, 1, 480) == bt709
+
+
+def test_dpb_warning_on_ctx_delay_and_pre_idr_no_false_alarm(capsys):
+    """ctx_delay > 0 warns even when dpb_lag == 0, while pre-IDR P-frame skips do not false-alarm."""
+    class _FakeDec:
+        def __init__(self, has_b_frames: bool, delay: int) -> None:
+            self.has_b_frames = has_b_frames
+            self.delay = delay
+
+    src = chiaki_tap.ChiakiSource.__new__(chiaki_tap.ChiakiSource)
+    src.tag = "[tap]"
+    src.decoder_kind = "cuda"
+    src.decoder_dpb_delay = None
+
+    assert src._check_dpb(_FakeDec(False, 2), 0, initial=True) is True
+    out = capsys.readouterr().out
+    assert "WARNING:" in out and "delay=2" in out
+
+    assert src._check_dpb(_FakeDec(False, 0), 0, initial=True, pre_idr=3) is False
+    out = capsys.readouterr().out
+    assert src.decoder_dpb_delay == 0
+    assert "0-frame DPB verified" in out and "WARNING:" not in out
+    assert "skipped 3 pre-IDR packet(s)" in out
+
+    assert src._check_dpb(_FakeDec(False, 0), 2, initial=True) is True
+    out = capsys.readouterr().out
+    assert "WARNING:" in out and "buffered 2 frame(s)" in out
+
+    assert src._check_dpb(_FakeDec(False, 1), 0, initial=False) is True
+    out = capsys.readouterr().out
+    assert "WARNING:" in out and "delay=1" in out
+
+
+def test_fused_nv12_ping_pong_buffer_safety():
+    """Successive CUDA launches alternate between 2 preallocated buffers without clobbering the previous frame."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    rng = np.random.default_rng(123)
+    frames = []
+    for _ in range(3):
+        y_p = torch.from_numpy(rng.integers(0, 256, size=(36, 128), dtype=np.uint8)).cuda()
+        uv_p = torch.from_numpy(rng.integers(0, 256, size=(18, 64, 2), dtype=np.uint8)).cuda()
+        frames.append((y_p[:, :64], uv_p[:, :32, :]))
+
+    out0 = chiaki_tap._FUSED_NV12_KERNEL.launch(*frames[0], 2, 1)
+    assert out0 is not None
+    ref0 = chiaki_tap._cuda_frame_to_bgr_torch(*frames[0], 2, 1)
+
+    out1 = chiaki_tap._FUSED_NV12_KERNEL.launch(*frames[1], 2, 1)
+    assert out1 is not None
+    assert out0.data_ptr() != out1.data_ptr()
+    # Frame 0 must remain intact after frame 1 was written to the second ping-pong buffer.
+    diff0 = (out0.to(torch.int16) - ref0.to(torch.int16)).abs()
+    assert int(diff0.max().item()) <= 1
+
+    out2 = chiaki_tap._FUSED_NV12_KERNEL.launch(*frames[2], 2, 1)
+    assert out2 is not None
+    assert out2.data_ptr() == out0.data_ptr()
+    ref2 = chiaki_tap._cuda_frame_to_bgr_torch(*frames[2], 2, 1)
+    diff2 = (out2.to(torch.int16) - ref2.to(torch.int16)).abs()
+    assert int(diff2.max().item()) <= 1
 
 
 def test_decoder_low_delay_zero_frame_dpb():
@@ -365,3 +440,175 @@ def test_mailbox_concurrent_producer_consumer():
     assert received == sorted(received)
     assert len(set(received)) == len(received)
     assert len(received) + mailbox.dropped == total
+
+
+def test_passthrough_bypasses_detector_and_interp_load():
+    """Pure passthrough (interp=False, no delay test, no scoring) skips it.load and detector.update."""
+    import math
+
+    p = _cpu_pipeline()
+    detector_calls = 0
+    load_calls = 0
+    orig_update = p.detector.update
+    orig_load = p.interp.load
+
+    def spy_update(frame_u8):
+        nonlocal detector_calls
+        detector_calls += 1
+        return orig_update(frame_u8)
+
+    def spy_load(frame):
+        nonlocal load_calls
+        load_calls += 1
+        return orig_load(frame)
+
+    p.detector.update = spy_update
+    p.interp.load = spy_load
+
+    frames = [torch.full((8, 8, 3), i * 25, dtype=torch.uint8) for i in range(6)]
+    written = []
+    diffs = []
+
+    class _Sink:
+        gpu = False
+
+        def write(self, frame, text=None):
+            written.append(frame)
+
+    def on_tick(tick, diff, action, proc_ms, t_start):
+        diffs.append(diff)
+
+    p.run(
+        (Tick(f, time.perf_counter(), i, new_hint=None) for i, f in enumerate(frames)),
+        _Sink(),
+        label="RIFE",
+        settings=Settings({"hz": 60, "even_out": False, "overlay": False, "interp": False}),
+        on_tick=on_tick,
+    )
+    assert detector_calls == 0
+    assert load_calls == 0
+    assert written == frames
+    assert len(diffs) == len(frames)
+    assert all(math.isnan(d.mean_diff) and math.isnan(d.max_diff) for d in diffs)
+
+    # With interp=True, both detector.update and it.load are called normally.
+    p.run(
+        (Tick(f, time.perf_counter(), i, new_hint=None) for i, f in enumerate(frames)),
+        _Sink(),
+        label="RIFE",
+        settings=Settings({"hz": 60, "even_out": False, "overlay": False, "interp": True}),
+    )
+    assert detector_calls == len(frames)
+    assert load_calls == len(frames)
+
+
+def test_live_120hz_framegen_off_and_60fps_passthrough_no_sleep(monkeypatch):
+    """--hz 120 with interp=False (and steady 60 fps passthrough) never sleeps in the hz > 60 pacer."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(pipeline, "sleep_until", lambda d, *a, **kw: (sleeps.append(d), time.perf_counter())[1])
+
+    class _Sink:
+        gpu = False
+
+        def write(self, frame, text=None):
+            pass
+
+    def bunched_stream(n: int = 10, new_hint_fn=lambda i: i % 2 == 0):
+        t0 = time.perf_counter()
+        for i in range(n):
+            now = t0 + i * 0.002  # 2 ms apart (< 1/120 s = 8.33 ms): would trigger sleep_until if gated wrong
+            yield Tick(torch.full((8, 8, 3), (i * 31) % 250, dtype=torch.uint8),
+                       now, i, new_hint=new_hint_fn(i), t_ready=now)
+
+    # 1) --hz 120 with interp=False -> zero sleep_until calls
+    _cpu_pipeline().run(
+        bunched_stream(),
+        _Sink(),
+        label="RIFE",
+        settings=Settings({"hz": 120, "even_out": False, "overlay": False, "interp": False}),
+        live=True,
+    )
+    assert sleeps == []
+
+    # 2) Steady 60 fps passthrough (all new real frames) at --hz 120 with interp=True -> zero sleep_until calls
+    #    after the 2-tick cadence startup (tick 1 interpolates once before tick 2 enters PENDING passthrough).
+    steady_sleeps: list[float] = []
+    monkeypatch.setattr(pipeline, "sleep_until", lambda d, *a, **kw: (steady_sleeps.append(d), time.perf_counter())[1])
+    _cpu_pipeline().run(
+        bunched_stream(n=10, new_hint_fn=lambda i: True),
+        _Sink(),
+        label="RIFE",
+        settings=Settings({"hz": 120, "even_out": False, "overlay": False, "interp": True}),
+        live=True,
+        on_tick=lambda tick, *_: steady_sleeps.clear() if tick.index == 3 else None,
+    )
+    assert steady_sleeps == []
+
+
+def test_async_cuda_event_timing_without_per_tick_sync(monkeypatch):
+    """gpu_out=True uses async cuda.Event pairs for proc_interp_ms with zero per-tick Stream.synchronize()."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    import math
+
+    class _CudaDummyInterp:
+        device = torch.device("cuda")
+        model_name = "dummy_cuda"
+        backend = "cuda"
+        steady_hud = False
+        h = 64
+        w = 64
+
+        def __init__(self) -> None:
+            self.in_u8 = None
+            self.slots = [None, None]
+
+        def load(self, frame) -> None:
+            self.in_u8 = frame
+
+        def prepare(self, slot: int) -> None:
+            self.slots[slot] = self.in_u8
+
+        def interpolate(self, slot: int, t: float = 0.5):
+            a = self.slots[0] if self.slots[0] is not None else self.in_u8
+            b = self.slots[1] if self.slots[1] is not None else self.in_u8
+            return ((a.float() + b.float()) * 0.5).to(torch.uint8)
+
+    p = Pipeline.__new__(Pipeline)
+    from framegen.cadence import DuplicateDetector
+    p.interp = _CudaDummyInterp()
+    p.detector = DuplicateDetector()
+    p.cut_threshold = 25.0
+    p.stats = None
+    p.waiting = None
+    p._out_pinned = torch.empty((64, 64, 3), dtype=torch.uint8)
+    p._out_np = p._out_pinned.numpy()
+
+    class _GpuSink:
+        gpu = True
+
+        def write(self, frame, text=None):
+            assert torch.is_tensor(frame) and frame.is_cuda
+
+    sync_calls = 0
+    orig_stream_sync = torch.cuda.Stream.synchronize
+
+    def spy_stream_sync(self, *args, **kwargs):
+        nonlocal sync_calls
+        sync_calls += 1
+        return orig_stream_sync(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda.Stream, "synchronize", spy_stream_sync)
+
+    frames = [torch.full((64, 64, 3), (i // 2) * 30, dtype=torch.uint8, device="cuda") for i in range(12)]
+    st = p.run(
+        (Tick(f, time.perf_counter(), i, new_hint=(i % 2 == 0)) for i, f in enumerate(frames)),
+        _GpuSink(),
+        label="RIFE",
+        settings=Settings({"hz": 60, "even_out": False, "overlay": False, "interp": True}),
+    )
+    assert sync_calls == 0
+    assert st.actions["interp"] > 0
+    assert len(st.proc_interp_ms) == st.actions["interp"]
+    assert all(math.isfinite(ms) and ms > 0.0 for ms in st.proc_interp_ms), st.proc_interp_ms

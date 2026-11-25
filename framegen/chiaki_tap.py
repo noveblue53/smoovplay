@@ -467,7 +467,7 @@ extern "C" __global__ void nv12_to_bgr_u8(
     float lum = ((float)y_plane[row * y_row_stride + col * y_col_stride] - yo) * ys;
 
     float src_y = ((float)row + 0.5f) * ((float)uv_h / (float)H) - 0.5f;
-    float src_x = ((float)col + 0.5f) * ((float)uv_w / (float)W) - 0.5f;
+    float src_x = (float)col * ((float)uv_w / (float)W);
     if (src_y < 0.0f) src_y = 0.0f;
     if (src_x < 0.0f) src_x = 0.0f;
     float max_y = (float)(uv_h - 1);
@@ -516,9 +516,10 @@ extern "C" __global__ void nv12_to_bgr_u8(
 """
 
 
-def _nv12_to_bgr_params(colorspace: int, color_range: int) -> tuple[float, float, float, float, float, float, float]:
+def _nv12_to_bgr_params(colorspace: int, color_range: int, height: int = 0) -> tuple[float, float, float, float, float, float, float]:
     """(yo, ys, cs, c_bu, c_gu, c_gv, c_rv) matching FFmpeg's NV12 -> BGR24 conversion."""
-    kr, kb = (0.2126, 0.0722) if colorspace == 1 else (0.299, 0.114)
+    is_bt709 = colorspace == 1 or (colorspace in (0, 2) and height >= 720)
+    kr, kb = (0.2126, 0.0722) if is_bt709 else (0.299, 0.114)
     kg = 1.0 - kr - kb
     ys, yo, cs = (1.0, 0.0, 1.0) if color_range == 2 else (255.0 / 219.0, 16.0, 255.0 / 224.0)
     return (yo, ys, cs, 2.0 * (1.0 - kb), -2.0 * kb * (1.0 - kb) / kg, -2.0 * kr * (1.0 - kr) / kg, 2.0 * (1.0 - kr))
@@ -533,6 +534,9 @@ class _FusedNV12Kernel:
         self._drv = None
         self._ptx: bytes | None = None
         self._funcs: dict[int, tuple[ctypes.c_void_p, ctypes.c_void_p]] = {}  # cuCtx -> (cuMod, cuFunc)
+        self._out_bufs: dict[tuple[int, int, str], tuple[object, object]] = {}
+        self._out_idx: dict[tuple[int, int, str], int] = {}
+        self._inflight: dict[tuple[int, int, str], list[tuple[object, object] | None]] = {}
 
     @staticmethod
     def _load_nvrtc():
@@ -565,6 +569,8 @@ class _FusedNV12Kernel:
             ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
         ]
         nvrtc.nvrtcCompileProgram.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+        nvrtc.nvrtcGetProgramLogSize.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+        nvrtc.nvrtcGetProgramLog.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         nvrtc.nvrtcGetPTXSize.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
         nvrtc.nvrtcGetPTX.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         nvrtc.nvrtcDestroyProgram.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
@@ -576,7 +582,15 @@ class _FusedNV12Kernel:
         try:
             # Compile to PTX (no arch-specific SASS) so the CUDA driver JITs it for any GPU including Blackwell.
             if nvrtc.nvrtcCompileProgram(prog, 0, None) != 0:
-                raise RuntimeError("nvrtcCompileProgram failed")
+                log_sz = ctypes.c_size_t()
+                log_txt = ""
+                if nvrtc.nvrtcGetProgramLogSize(prog, ctypes.byref(log_sz)) == 0 and log_sz.value > 1:
+                    log_buf = ctypes.create_string_buffer(log_sz.value)
+                    if nvrtc.nvrtcGetProgramLog(prog, log_buf) == 0:
+                        log_txt = log_buf.value.decode("utf-8", errors="replace").strip()
+                if log_txt:
+                    print(f"[chiaki] nvrtcCompileProgram log:\n{log_txt}", file=sys.stderr)
+                raise RuntimeError(f"nvrtcCompileProgram failed: {log_txt}" if log_txt else "nvrtcCompileProgram failed")
             size = ctypes.c_size_t()
             if nvrtc.nvrtcGetPTXSize(prog, ctypes.byref(size)) != 0 or size.value == 0:
                 raise RuntimeError("nvrtcGetPTXSize failed")
@@ -628,7 +642,19 @@ class _FusedNV12Kernel:
                 print(f"[chiaki] fused NV12->BGR CUDA kernel unavailable ({e}); using PyTorch fallback")
                 return None, None
 
-    def launch(self, y, uv, colorspace: int, color_range: int):
+    def flush(self) -> None:
+        """Synchronize any in-flight kernel events and release held NVDEC frame references."""
+        with self._lock:
+            pending: list[tuple[object, object]] = []
+            for slots in self._inflight.values():
+                for i, entry in enumerate(slots):
+                    if entry is not None:
+                        pending.append(entry)
+                        slots[i] = None
+        for ev, _ in pending:
+            ev.synchronize()
+
+    def launch(self, y, uv, colorspace: int, color_range: int, hold=None):
         import torch
         if (y.dtype != torch.uint8 or uv.dtype != torch.uint8 or not y.is_cuda or not uv.is_cuda
                 or y.ndim != 2 or uv.ndim != 3 or uv.shape[2] != 2):
@@ -638,8 +664,26 @@ class _FusedNV12Kernel:
             return None
         h, w = int(y.shape[0]), int(y.shape[1])
         uv_h, uv_w = int(uv.shape[0]), int(uv.shape[1])
-        out = torch.empty((h, w, 3), dtype=torch.uint8, device=y.device)
-        yo, ys, cs, c_bu, c_gu, c_gv, c_rv = _nv12_to_bgr_params(colorspace, color_range)
+        key = (h, w, str(y.device))
+        with self._lock:
+            pair = self._out_bufs.get(key)
+            if pair is None:
+                pair = (
+                    torch.empty((h, w, 3), dtype=torch.uint8, device=y.device),
+                    torch.empty((h, w, 3), dtype=torch.uint8, device=y.device),
+                )
+                self._out_bufs[key] = pair
+                self._out_idx[key] = 0
+                self._inflight[key] = [None, None]
+            idx = self._out_idx[key]
+            self._out_idx[key] = idx ^ 1
+            out = pair[idx]
+            prev = self._inflight[key][idx]
+            self._inflight[key][idx] = None
+        if prev is not None:
+            prev[0].synchronize()
+            del prev
+        yo, ys, cs, c_bu, c_gu, c_gv, c_rv = _nv12_to_bgr_params(colorspace, color_range, h)
         args = (
             ctypes.c_void_p(y.data_ptr()),
             ctypes.c_void_p(uv.data_ptr()),
@@ -652,7 +696,8 @@ class _FusedNV12Kernel:
             ctypes.c_float(c_bu), ctypes.c_float(c_gu), ctypes.c_float(c_gv), ctypes.c_float(c_rv),
         )
         ptrs = (ctypes.c_void_p * len(args))(*(ctypes.addressof(a) for a in args))
-        stream = ctypes.c_void_p(int(torch.cuda.current_stream(y.device).cuda_stream))
+        cur_stream = torch.cuda.current_stream(y.device)
+        stream = ctypes.c_void_p(int(cur_stream.cuda_stream))
         rc = drv.cuLaunchKernel(
             fn,
             (w + 15) // 16, (h + 15) // 16, 1,
@@ -662,6 +707,10 @@ class _FusedNV12Kernel:
         if rc != 0:
             self._failed = True
             return None
+        ev = torch.cuda.Event()
+        ev.record(cur_stream)
+        with self._lock:
+            self._inflight[key][idx] = (ev, (hold, y, uv))
         return out
 
 
@@ -672,10 +721,17 @@ def _cuda_frame_to_bgr_torch(y, uv, colorspace: int, color_range: int):
     """Reference PyTorch NV12 -> HxWx3 uint8 BGR conversion (fallback when NVRTC isn't available)."""
     import torch
     import torch.nn.functional as F
-    yo, ys, cs, c_bu, c_gu, c_gv, c_rv = _nv12_to_bgr_params(colorspace, color_range)
+    h, w = int(y.shape[0]), int(y.shape[1])
+    uv_w = int(uv.shape[1])
+    yo, ys, cs, c_bu, c_gu, c_gv, c_rv = _nv12_to_bgr_params(colorspace, color_range, h)
     lum = (y.float() - yo) * ys
-    c = F.interpolate(uv.permute(2, 0, 1).unsqueeze(0).float() - 128.0, size=y.shape, mode="bilinear",
-                      align_corners=False)[0] * cs
+    c_v = F.interpolate(uv.permute(2, 0, 1).unsqueeze(0).float() - 128.0, size=(h, uv_w),
+                        mode="bilinear", align_corners=False)[0]
+    src_x = (torch.arange(w, device=y.device, dtype=torch.float32) * (uv_w / float(w))).clamp_(0.0, float(uv_w - 1))
+    x0 = src_x.long()
+    x1 = (x0 + 1).clamp_(max=uv_w - 1)
+    wx = (src_x - x0.float()).view(1, 1, w)
+    c = (c_v[:, :, x0] * (1.0 - wx) + c_v[:, :, x1] * wx) * cs
     u, v = c[0], c[1]
     b = lum + c_bu * u
     g = lum + c_gu * u + c_gv * v
@@ -686,19 +742,24 @@ def _cuda_frame_to_bgr_torch(y, uv, colorspace: int, color_range: int):
 def cuda_frame_to_bgr(fr):
     """A decoded NVDEC frame (NV12, still on the GPU) -> HxWx3 uint8 BGR CUDA tensor, without leaving the GPU.
 
-    Matches FFmpeg's CPU conversion: BT.709 when the stream says so, else BT.601; limited range unless tagged full.
-    Uses a single fused CUDA kernel (bilinear UV + color matrix + clamp/round/uint8) on PyTorch's current stream
-    so no extra sync or intermediate FP32 VRAM buffers are needed, falling back to PyTorch ops if NVRTC is absent.
+    Matches FFmpeg's CPU conversion: BT.709 when tagged or HD (>=720p) with unspecified colorspace, else BT.601;
+    limited range unless tagged full; H.264 Type-0 left-cosited horizontal chroma siting.
+    Uses a single fused CUDA kernel (bilinear UV + color matrix + clamp/round/uint8) into a preallocated
+    2-buffer ping-pong tensor on PyTorch's current stream, holding the source NVDEC frame alive via an async
+    cuda.Event until that buffer slot is reused so FFmpeg never recycles the surface while the kernel reads it.
     """
     import torch
     if fr.format.name != "cuda":  # the decoder fell back to software for this stream
         return torch.from_numpy(fr.to_ndarray(format="bgr24")).cuda()
     y = torch.from_dlpack(fr.planes[0].__dlpack__())   # H x W
     uv = torch.from_dlpack(fr.planes[1].__dlpack__())  # H/2 x W/2 x 2
-    out = _FUSED_NV12_KERNEL.launch(y, uv, fr.colorspace, fr.color_range)
+    out = _FUSED_NV12_KERNEL.launch(y, uv, fr.colorspace, fr.color_range, hold=fr)
     if out is not None:
         return out
-    return _cuda_frame_to_bgr_torch(y, uv, fr.colorspace, fr.color_range)
+    out = _cuda_frame_to_bgr_torch(y, uv, fr.colorspace, fr.color_range)
+    if y.is_cuda:
+        torch.cuda.current_stream(y.device).synchronize()
+    return out
 
 
 class ChiakiSource:
@@ -794,6 +855,21 @@ class ChiakiSource:
         ctx.flags |= av.codec.context.Flags.low_delay
         return ctx
 
+    def _check_dpb(self, dec, dpb_lag: int, *, initial: bool = True, pre_idr: int = 0) -> bool:
+        """Check decoder DPB lag / B-frame / delay flags and log status. Returns True if a warning was emitted."""
+        self.decoder_dpb_delay = dpb_lag
+        has_b = bool(getattr(dec, "has_b_frames", False))
+        ctx_delay = int(getattr(dec, "delay", 0) or 0)
+        if dpb_lag > 0 or has_b or ctx_delay > 0:
+            print(f"{self.tag} WARNING: {self.decoder_kind} decoder buffered {dpb_lag} frame(s) in DPB "
+                  f"(has_b_frames={int(has_b)}, delay={ctx_delay})")
+            return True
+        if initial:
+            extra = f", skipped {pre_idr} pre-IDR packet(s)" if pre_idr > 0 else ""
+            print(f"{self.tag} {self.decoder_kind} decoder: 0-frame DPB verified "
+                  f"(low_delay=1, has_b_frames=0, delay=0{extra})")
+        return False
+
     def _reader(self) -> None:
         import av
 
@@ -806,6 +882,8 @@ class ChiakiSource:
         #                     takes it on its own)
         decoded = False     # a picture has come out of this stream
         dpb_held = 0        # packets fed to the current decoder before its first emitted picture
+        pkt_idx = 0         # monotonic packet index fed to dec (tagged via pkt.pts to measure true DPB lag)
+        dpb_recheck = False # re-check has_b_frames / delay after mid-stream SPS/PPS change
         damaged_left = 0    # frames still treated as damaged after a gap
         errors = 0          # decode errors in a row
         passed = False      # frames went by undecoded (joined late, the pipeline not ready yet, or held)
@@ -829,7 +907,8 @@ class ChiakiSource:
                     print(f"{self.tag} stream size changed to {h.width}x{h.height}; restart run.py", file=sys.stderr)
                     self.q.close()
                     return
-                dec, params, pending, decoded, dpb_held, damaged_left, errors, held = None, b"", b"", False, 0, 0, 0, -1
+                dec, params, pending, decoded, dpb_held, pkt_idx, dpb_recheck = None, b"", b"", False, 0, 0, False
+                damaged_left, errors, held = 0, 0, -1
                 sizes = SizeRepeatDetector()
                 # Read it from its first packet (the codec header) while that's still in the ring.
                 seq = 0 if h.write_seq <= SLOTS - 4 else h.write_seq
@@ -848,7 +927,7 @@ class ChiakiSource:
                     import torch
                     torch.zeros(1, device="cuda")  # PyTorch's CUDA context, current on this thread for the decoder
                     on_gpu = True
-                dec, pending, dpb_held = self._new_decoder(codec), params, 0
+                dec, pending, dpb_held, pkt_idx, dpb_recheck = self._new_decoder(codec), params, 0, 0, False
             if going and passed and params:
                 # Frames went by undecoded: ask the PS5 for a refresh frame and hold what comes out until the
                 # picture is whole again.
@@ -891,6 +970,8 @@ class ChiakiSource:
             if ps:
                 if ps != params:
                     self._save_header(session, h.codec, ps)
+                    if decoded:
+                        dpb_recheck = True
                 params, self._no_header = ps, False
                 if all(t in PARAM_NALS[codec] for t, _ in nal_units(p.data, codec)):  # the header on its own
                     pending = ps
@@ -909,8 +990,12 @@ class ChiakiSource:
             key = is_keyframe(p.data, codec)
             t = time.perf_counter()
             try:
+                in_idx = pkt_idx
+                pkt_idx += 1
+                pkt = av.Packet(pending + p.data if pending else p.data)
+                pkt.pts = in_idx
                 with CAPTURE_LOCK:  # no GPU decoding while the pipeline captures its CUDA graphs (startup only)
-                    frames = dec.decode(av.Packet(pending + p.data if pending else p.data))
+                    frames = dec.decode(pkt)
                     images = [self._image(fr) for fr in frames]
                 pending, errors = b"", 0
             except av.error.FFmpegError as e:
@@ -919,22 +1004,23 @@ class ChiakiSource:
                 print(f"{self.tag} decode error at frame {p.seq}: {e}", file=sys.stderr)
                 damaged_left, errors = DAMAGE_HOLD, errors + 1
                 if errors >= 30:  # stuck: start a decoder afresh from the saved header
-                    dec, errors, pending, dpb_held = self._new_decoder(codec), 0, params, 0
+                    _FUSED_NV12_KERNEL.flush()
+                    dec, errors, pending, dpb_held, pkt_idx, dpb_recheck = self._new_decoder(codec), 0, params, 0, 0, False
                 self._ask_idr()
                 continue
-            if not frames:  # (a decoder that holds a frame back in DPB)
+            if not frames:  # (a decoder that holds a frame back in DPB, or drops pre-IDR P-frames)
                 if not decoded:
                     dpb_held += 1
                 continue
+            last_pts = frames[-1].pts
+            dpb_lag = max(0, in_idx - int(last_pts)) if last_pts is not None else dpb_held
             if not decoded:
-                self.decoder_dpb_delay = dpb_held
-                has_b = bool(getattr(dec, "has_b_frames", False))
-                ctx_delay = int(getattr(dec, "delay", 0) or 0)
-                if dpb_held > 0 or has_b:
-                    print(f"{self.tag} WARNING: {self.decoder_kind} decoder buffered {dpb_held} frame(s) in DPB "
-                          f"(has_b_frames={int(has_b)}, delay={ctx_delay})")
-                else:
-                    print(f"{self.tag} {self.decoder_kind} decoder: 0-frame DPB verified (low_delay=1, has_b_frames=0)")
+                self._check_dpb(dec, dpb_lag, initial=True, pre_idr=dpb_held if dpb_lag == 0 else 0)
+            elif dpb_recheck:
+                dpb_recheck = False
+                self._check_dpb(dec, dpb_lag, initial=False)
+            elif dpb_lag > (self.decoder_dpb_delay or 0):
+                self._check_dpb(dec, dpb_lag, initial=False)
             decoded = True
             size_new = sizes.update(len(p.data), key)
             damaged = bool(p.frames_lost > 0 or p.recovered or p.truncated or damaged_left > 0)
@@ -945,6 +1031,7 @@ class ChiakiSource:
                             t_ready=p.t_arrival + decode_ms / 1000,
                             extra={"seq": p.seq, "size": len(p.data), "frames_lost": p.frames_lost,
                                    "recovered": p.recovered, "keyframe": key, "decode_ms": decode_ms,
+                                   "dpb_lag": dpb_lag,
                                    # the size check's call: for the stream check, test mode and the frame log
                                    "size_new": size_new, "size_ref": sizes.ref, "big": sizes.big})
                 if self.test is not None and (tick := self.test(tick)) is None:
@@ -952,6 +1039,7 @@ class ChiakiSource:
                 if self.q.put(tick):
                     self.dropped += 1
             damaged_left = max(0, damaged_left - 1)
+        _FUSED_NV12_KERNEL.flush()
 
     def _image(self, fr):
         if self.convert is not None:

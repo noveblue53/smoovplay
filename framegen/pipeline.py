@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from . import delaytest
-from .cadence import Action, CadenceScheduler, CutDetector, DipWatch, DuplicateDetector, FrameTimeline, RhythmLock
+from .cadence import Action, CadenceScheduler, CutDetector, DipWatch, DuplicateDetector, FrameDiff, FrameTimeline, RhythmLock
 from .hdr import level8, to_u8
 from .interpolator import STEADY_HUD_THRESHOLD, RifeInterpolator
 from .io import TICK, MiniText, Waiting
@@ -423,6 +423,31 @@ class Pipeline:
         # A sink that takes CUDA tensors (the GL window with CUDA-GL interop) gets generated frames without a
         # GPU->CPU->GPU round trip; otherwise they're downloaded into pinned memory as before.
         gpu_out = bool(getattr(sink, "gpu", False))
+        cuda_timing = gpu_out and torch.cuda.is_available() and str(getattr(it, "device", "cpu")).startswith("cuda")
+        event_pool: deque[tuple[torch.cuda.Event, torch.cuda.Event]] = deque()
+        pending_gpu_events: deque[tuple[torch.cuda.Event, torch.cuda.Event]] = deque()
+
+        def drain_gpu_events(sync: bool = False) -> None:
+            if sync and pending_gpu_events:
+                pending_gpu_events[-1][1].synchronize()
+            while pending_gpu_events and (sync or pending_gpu_events[0][1].query()):
+                ev_s, ev_e = pending_gpu_events.popleft()
+                st.proc_interp_ms.append(float(ev_s.elapsed_time(ev_e)))
+                event_pool.append((ev_s, ev_e))
+
+        def interp_timed(s: int, t: float) -> torch.Tensor:
+            if not cuda_timing:
+                return it.interpolate(s, t)
+            ev_s, ev_e = event_pool.popleft() if event_pool else (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            ev_s.record()
+            res = it.interpolate(s, t)
+            ev_e.record()
+            pending_gpu_events.append((ev_s, ev_e))
+            return res
+
         last_proc = 0.0
         unshown: float | None = None  # arrival time of the newest real frame not yet presented as itself
         t_start = time.perf_counter()
@@ -549,6 +574,8 @@ class Pipeline:
                 if settings.interp != enabled:
                     enabled, sched, quarter_due, ov_next = settings.interp, CadenceScheduler(), False, 0.0
                     key_slot = prev_key_slot = None
+                    next_due, prev_was_interp = 0.0, False
+                    self.detector.reset()
                     print(f"[pipeline] interpolation {'ON' if enabled else 'OFF'}")
                 if settings.steady_hud != steady:
                     steady = settings.steady_hud
@@ -559,20 +586,26 @@ class Pipeline:
                 replay_on = bool(replay is not None and replay.length)
                 it.rgb10a2_out = bool(gpu_out and getattr(sink, "rgb10a2_vsr", False) and not replay_on)
             t0 = time.perf_counter()
+            drain_gpu_events(sync=False)
             st.queue_ms.append((t0 - tick.t_arrival) * 1000)
             if tick.ready_event is not None:
                 cur_stream = torch.cuda.current_stream()
                 cur_stream.wait_event(tick.ready_event)
                 if torch.is_tensor(tick.frame) and tick.frame.is_cuda:
                     tick.frame.record_stream(cur_stream)
-            if torch.is_tensor(tick.frame):  # already on the GPU (hardware decoder)
-                it.load(tick.frame)
+            passthrough = not enabled and delay_test is None and not scoring
+            if passthrough:
+                is_new = True if tick.new_hint is None else tick.new_hint
+                diff = FrameDiff(is_new, float("nan"), float("nan"))
             else:
-                np.copyto(self._in_np, tick.frame)
-                it.load(self._in_pinned)
-            diff = self.detector.update(it.in_u8)
-            # A source that knows better (the frame tap's flags, test mode) overrides the image check.
-            is_new = diff.is_new if tick.new_hint is None else tick.new_hint
+                if torch.is_tensor(tick.frame):  # already on the GPU (hardware decoder)
+                    it.load(tick.frame)
+                else:
+                    np.copyto(self._in_np, tick.frame)
+                    it.load(self._in_pinned)
+                diff = self.detector.update(it.in_u8)
+                # A source that knows better (the frame tap's flags, test mode) overrides the image check.
+                is_new = diff.is_new if tick.new_hint is None else tick.new_hint
             # Dip smoothing, by the picture's own call (the 30 fps lock below can't see a dip); not in
             # test mode, which decides what's new itself, nor without a window
             dip_watch.update(is_new)
@@ -643,6 +676,8 @@ class Pipeline:
 
             to_score = None
             early_cmd = None  # 90/120 Hz: the first of this tick's two frames, already shown
+            early_shown = False
+            interp_gpu_timed = False
             mid_t = 0.5  # the generated frame this tick ends on
             pace_wait_s = 0.0
             # Behind = waiting frames, not decode time: a Remote Play frame's arrival is before its ~3-11 ms decode.
@@ -652,7 +687,7 @@ class Pipeline:
             st.behind += behind
             extra_ok = hz > 60 and sink is not None and not behind
 
-            def present(frame, text: str, pace_60: bool = False):
+            def present(frame, text: str, pace_60: bool = False, pace_hi: bool = False):
                 # Frame pacer: each present is due one gap after the previous one was *due*, so sleep overshoot and
                 # present time don't accumulate; when late it goes straight away and the schedule restarts from now.
                 # Locked to the display (VSync on a refresh rate that fits, framegen/display_sync.py) the sink waits
@@ -664,12 +699,15 @@ class Pipeline:
                 if getattr(sink, "paced_by_display", False):
                     next_due = 0.0  # (picked up afresh if the display stops pacing)
                 elif hz > 60:
-                    now = time.perf_counter()
-                    if next_due > now:
-                        woke = sleep_until(next_due)
-                        pace_wait_s += woke - now
-                        now = woke
-                    next_due = max(next_due, now) + gap
+                    if pace_hi:
+                        now = time.perf_counter()
+                        if next_due > now:
+                            woke = sleep_until(next_due)
+                            pace_wait_s += woke - now
+                            now = woke
+                        next_due = max(next_due, now) + gap
+                    else:
+                        next_due = 0.0
                 elif is_live:
                     now = time.perf_counter()
                     if pace_60 and next_due > 0.0:
@@ -690,11 +728,12 @@ class Pipeline:
                 return cmd
 
             def show_early(t: float) -> bool:
-                nonlocal early_cmd
+                nonlocal early_cmd, early_shown
                 if not extra_ok:
                     st.quarter_skipped += 1
                     return False
-                early_cmd = present(self._generated(it.interpolate(slot, t), gpu_out), ov_text)
+                early_cmd = present(self._generated(it.interpolate(slot, t), gpu_out), ov_text, pace_hi=True)
+                early_shown = True
                 st.quarter_shown += 1
                 return True
 
@@ -757,10 +796,14 @@ class Pipeline:
                             frame = pl.a.frame
                         else:
                             slot = self._timed_pair(pl.a, pl.b, slot, in_slot)
-                            frame = self._generated(it.interpolate(slot, pl.t), gpu_out)
+                            if k == len(phases) - 1:
+                                frame = self._generated(interp_timed(slot, pl.t), gpu_out)
+                                interp_gpu_timed = cuda_timing
+                            else:
+                                frame = self._generated(it.interpolate(slot, pl.t), gpu_out)
                         st.uneven_waits += pl.waiting
                         if k < len(phases) - 1:
-                            early_cmd = present(frame, ov_text) or early_cmd
+                            early_cmd = present(frame, ov_text, pace_hi=True) or early_cmd
                             t_now = time.perf_counter()
                             st.real_delay_ms.extend((t_now - f.t_arrival) * 1000 for f in pl.reached)
                         else:
@@ -778,7 +821,8 @@ class Pipeline:
                 if timed:
                     pass  # shown above
                 elif action is Action.INTERP:
-                    out = self._generated(it.interpolate(slot, mid_t), gpu_out)
+                    out = self._generated(interp_timed(slot, mid_t), gpu_out)
+                    interp_gpu_timed = cuda_timing
                     # --score has ground truth only at the midpoint
                     if gt_fn is not None and key_gpu is not None and mid_t == 0.5:
                         to_score = (key_frame, key_content)  # scored once the frame is on screen
@@ -802,7 +846,11 @@ class Pipeline:
 
             t_ready = time.perf_counter()
             last_proc = (t_ready - t0) * 1000
-            (st.proc_interp_ms if action is Action.INTERP else st.proc_other_ms).append(last_proc)
+            if action is Action.INTERP:
+                if not interp_gpu_timed:
+                    st.proc_interp_ms.append(last_proc)
+            else:
+                st.proc_other_ms.append(last_proc)
             st.actions[action.value] += 1
             if on_tick is not None:
                 on_tick(tick, diff, action, last_proc, t0)
@@ -840,7 +888,8 @@ class Pipeline:
                                 sink.toast(advice, 8.0)
                     ov_text, ov_next = overlay_text(), t_ready + 0.25
                 pace_60 = prev_was_interp and action is not Action.INTERP and (timed or not is_new)
-                cmd = present(out, ov_text, pace_60=pace_60) or early_cmd
+                pace_hi = enabled and (timed or action is Action.INTERP or prev_was_interp or early_shown)
+                cmd = present(out, ov_text, pace_60=pace_60, pace_hi=pace_hi) or early_cmd
             prev_was_interp = enabled and action is Action.INTERP
             t_shown = time.perf_counter()
             st.busy_ms.append(max(0.0, (t_shown - t0 - pace_wait_s) * 1000))
@@ -897,8 +946,11 @@ class Pipeline:
                     else:
                         enabled = not enabled
                         sched = CadenceScheduler()
+                        next_due, prev_was_interp = 0.0, False
+                        self.detector.reset()
                         print(f"[pipeline] interpolation {'ON' if enabled else 'OFF'}")
 
+        drain_gpu_events(sync=True)
         st.wall_s = time.perf_counter() - t_start
         return st
 
@@ -930,9 +982,9 @@ class Pipeline:
         return slot
 
     def _generated(self, frame: torch.Tensor, gpu_out: bool):
-        """A generated frame for the sink, waited for (a sync point, so timings are real)."""
+        """A generated frame for the sink. On the GPU path, stay async on the current CUDA stream so
+        VFG/RIFE -> VSR -> RCAS -> GL overlap without a CPU-GPU sync bubble."""
         if gpu_out:
-            torch.cuda.current_stream().synchronize()
             return frame
         self._out_pinned.copy_(frame)  # blocking D2H copy
         return self._out_np
