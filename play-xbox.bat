@@ -45,11 +45,17 @@ if not defined PY_CMD (
 )
 
 :: 2. Build/update smoovplay-xbox.exe automatically (Go caches unchanged builds)
+set "GO_CMD="
 where go >nul 2>&1
 if %errorlevel% equ 0 (
+    set "GO_CMD=go"
+) else if exist "C:\Program Files\Go\bin\go.exe" (
+    set "GO_CMD="C:\Program Files\Go\bin\go.exe""
+)
+if defined GO_CMD (
     echo [xbox] Building smoovplay-xbox.exe...
     pushd "%XBOX_DIR%"
-    go build -o smoovplay-xbox.exe ./cmd/smoovplay-xbox
+    %GO_CMD% build -o smoovplay-xbox.exe ./cmd/smoovplay-xbox
     set "BUILD_ERR=!errorlevel!"
     popd
     if !BUILD_ERR! neq 0 (
@@ -58,7 +64,8 @@ if %errorlevel% equ 0 (
         exit /b !BUILD_ERR!
     )
 ) else if not exist "%XBOX_EXE%" (
-    echo [error] "%XBOX_EXE%" not found and Go is not installed on PATH.
+    echo [error] "%XBOX_EXE%" not found and Go is not installed.
+    echo         Install Go with: winget install GoLang.Go
     pause
     exit /b 1
 )
